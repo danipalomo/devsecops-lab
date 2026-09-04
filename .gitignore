@@ -1,0 +1,24 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+override.tf
+override.tf.json
+
+# Ansible
+*.retry
+*.log
+
+# Docker & LocalStack
+.localstack/
+
+# Entornos Python
+.venv/
+venv/
+__pycache__/
+
+# Archivos de SO y Editores
+.DS_Store
+.vscode/
+.idea/
