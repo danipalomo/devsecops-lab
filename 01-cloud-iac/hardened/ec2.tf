@@ -1,4 +1,4 @@
-# HARDENING: Clave SSH leída desde el archivo real e instancia en subred privada
+# HARDENING: Clave SSH leída desde archivo e instancia en subred privada
 resource "aws_key_pair" "deployer" {
   key_name   = "devsecops-deployer-key"
   public_key = file("~/.ssh/devsecops_lab_key.pub")
@@ -15,6 +15,19 @@ resource "aws_instance" "app_server" {
     Environment = "Hardened"
     ManagedBy   = "Ansible"
   }
+}
+
+# AUTOMATIZACIÓN: Generación automática del inventario de Ansible con los datos de Terraform
+resource "local_file" "ansible_inventory" {
+  content = <<EOT
+[target_hosts]
+localhost ansible_connection=local
+
+[ec2_instances]
+${aws_instance.app_server.private_ip} ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/devsecops_lab_key
+EOT
+
+  filename = "${path.module}/../../02-provisioning/inventory.ini"
 }
 
 output "instance_ip" {

@@ -1,0 +1,13 @@
+---
+- name: Configuracion Insegura del Sistema Operativo (Vulnerable)
+  hosts: target_hosts
+  become: yes
+  tasks:
+    - name: VULNERABILIDAD - Desactivar Firewall del sistema (UFW)
+      ufw:
+        state: disabled
+
+    - name: VULNERABILIDAD - Socket de Docker expuesto a todos los usuarios (0777)
+      file:
+        path: /var/run/docker.sock
+        mode: '0777'

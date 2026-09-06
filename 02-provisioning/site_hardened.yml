@@ -1,0 +1,40 @@
+---
+- name: Hardening del Sistema Operativo y Configuracion del Entorno
+  hosts: target_hosts
+  become: yes
+  tasks:
+    - name: Asegurar que los paquetes del sistema esten actualizados
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Instalar herramientas de seguridad basicas
+      apt:
+        name:
+          - ufw
+          - fail2ban
+        state: present
+
+    - name: Configurar Firewall (UFW) - Denegar entrada por defecto
+      ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: Permitir trafico SSH (22) y K3s/HTTP
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - '22'
+        - '80'
+        - '443'
+        - '6443'
+
+    - name: Asegurar permisos del socket de Docker (Restringir acceso root)
+      file:
+        path: /var/run/docker.sock
+        owner: root
+        group: docker
+        mode: '0660'
