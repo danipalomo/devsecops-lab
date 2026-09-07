@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: act-runner
+  namespace: gitea
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: act-runner
+  template:
+    metadata:
+      labels:
+        app: act-runner
+    spec:
+      containers:
+      - name: runner
+        image: gitea/act_runner:latest
+        command:
+        - sh
+        - -c
+        - |
+          if [ ! -f /data/.runner ]; then
+            act_runner register --instance http://gitea-service.gitea.svc.cluster.local:3000 --token x63ITQWKbeJHcS6qetnn8LbsFYVscSsSxxX9hjbF --name k3s-devsecops-runner --no-interactive
+          fi
+          act_runner daemon
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
+        - name: runner-data
+          mountPath: /data
+        resources:
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+      volumes:
+      - name: docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+      - name: runner-data
+        emptyDir: {}
