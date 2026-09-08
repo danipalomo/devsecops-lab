@@ -1,3 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: act-runner-config
+  namespace: gitea
+data:
+  config.yaml: |
+    log:
+      level: info
+    runner:
+      file: /data/.runner
+      capacity: 1
+      envs:
+        DOCKER_HOST: unix:///var/run/docker.sock
+      timeout: 3h
+      insecure: true
+      labels:
+        - "ubuntu-latest:docker://node:16-bullseye"
+        - "ubuntu-22.04:docker://node:16-bullseye"
+        - "ubuntu-20.04:docker://node:16-bullseye"
+    container:
+      network: "host"
+      privileged: true
+      force_pull: false
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,6 +38,13 @@ spec:
       labels:
         app: act-runner
     spec:
+      initContainers:
+      - name: init-runner-permissions
+        image: busybox:latest
+        command: ['sh', '-c', 'chown -R 0:0 /data && chmod -R 775 /data']
+        volumeMounts:
+        - name: runner-data
+          mountPath: /data
       containers:
       - name: runner
         image: gitea/act_runner:latest
@@ -21,9 +53,9 @@ spec:
         - -c
         - |
           if [ ! -f /data/.runner ]; then
-            act_runner register --instance http://gitea-service.gitea.svc.cluster.local:3000 --token x63ITQWKbeJHcS6qetnn8LbsFYVscSsSxxX9hjbF --name k3s-devsecops-runner --no-interactive
+            act_runner register --config /etc/act_runner/config.yaml --instance http://192.168.252.10:30000 --token y2HtdzweXvxJ4g11FGxcByl8A2DjH1UiU6tpXYGl --name k3s-devsecops-runner --no-interactive
           fi
-          act_runner daemon
+          act_runner daemon --config /etc/act_runner/config.yaml
         securityContext:
           privileged: true
         volumeMounts:
@@ -31,16 +63,23 @@ spec:
           mountPath: /var/run/docker.sock
         - name: runner-data
           mountPath: /data
+        - name: config
+          mountPath: /etc/act_runner
         resources:
           limits:
+            memory: "4Gi"
+            cpu: "4000m"
+          requests:
             memory: "1Gi"
             cpu: "1000m"
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
       volumes:
       - name: docker-socket
         hostPath:
           path: /var/run/docker.sock
       - name: runner-data
-        emptyDir: {}
+        hostPath:
+          path: /var/lib/act-runner-data
+          type: DirectoryOrCreate
+      - name: config
+        configMap:
+          name: act-runner-config

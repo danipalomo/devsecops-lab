@@ -24,7 +24,7 @@ jobs:
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
+          mv kubectl /usr/local/bin/ || cp kubectl /usr/bin/
 
       - name: Desplegar entorno Hardened en K3s
         run: |
