@@ -1,0 +1,35 @@
+name: 02 - CD Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  deploy-k3s:
+    name: Deploy Hardened Environment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v3
+
+      - name: Configurar Kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Instalar kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Desplegar entorno Hardened en K3s
+        run: |
+          echo "Aplicando manifiestos Hardened..."
+          kubectl apply -f k8s/hardened/dvwa-hardened.yaml
+
+          echo "Verificando el estado del despliegue..."
+          kubectl rollout status deployment/dvwa-deployment -n hardened-apps --timeout=60s || true

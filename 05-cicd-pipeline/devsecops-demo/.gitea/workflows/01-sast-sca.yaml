@@ -1,0 +1,39 @@
+name: 01 - SAST & SCA Security Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  gitleaks-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Scan
+        uses: zricethezav/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trivy-scan:
+    name: SAST & IaC Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: gitleaks-scan
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v3
+
+      - name: Escaneo de Manifiestos K8s y Código
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          hide-shortcut-text: 'true'
+          exit-code: '0'
+          format: 'table'
