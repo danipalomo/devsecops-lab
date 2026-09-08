@@ -31,14 +31,16 @@ spec:
           mountPath: /var/lib/gitea
         resources:
           limits:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "1Gi"
+            cpu: "1000m"
           requests:
             memory: "256Mi"
             cpu: "100m"
       volumes:
       - name: gitea-data
-        emptyDir: {}
+        hostPath:
+          path: /var/lib/gitea-data
+          type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
