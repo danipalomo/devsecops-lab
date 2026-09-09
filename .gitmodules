@@ -1,0 +1,3 @@
+[submodule "04-cicd-pipeline/devsecops-demo"]
+	path = 04-cicd-pipeline/devsecops-demo
+	url = http://192.168.252.10:30000/danip/devsecops-demo.git
