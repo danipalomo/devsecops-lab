@@ -19,9 +19,10 @@ data:
         - "ubuntu-22.04:docker://node:16-bullseye"
         - "ubuntu-20.04:docker://node:16-bullseye"
     container:
-      network: "host"
+      network: "bridge"
       privileged: true
       force_pull: false
+      rm: true # 1. Borra automáticamente los contenedores de los jobs
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -41,10 +42,12 @@ spec:
       initContainers:
       - name: init-runner-permissions
         image: busybox:latest
-        command: ['sh', '-c', 'chown -R 0:0 /data && chmod -R 775 /data']
+        command: ['sh', '-c', 'chown -R 0:0 /data /root/.cache && chmod -R 777 /data /root/.cache']
         volumeMounts:
         - name: runner-data
           mountPath: /data
+        - name: act-cache
+          mountPath: /root/.cache/act
       containers:
       - name: runner
         image: gitea/act_runner:latest
@@ -63,6 +66,8 @@ spec:
           mountPath: /var/run/docker.sock
         - name: runner-data
           mountPath: /data
+        - name: act-cache
+          mountPath: /root/.cache/act # 2. Aísla la descarga de acciones en memoria RAM/Tmpfs
         - name: config
           mountPath: /etc/act_runner
         resources:
@@ -70,8 +75,8 @@ spec:
             memory: "4Gi"
             cpu: "4000m"
           requests:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "512Mi"
+            cpu: "250m" # 3. Evita estrangulamiento de CPU (Throttling)
       volumes:
       - name: docker-socket
         hostPath:
@@ -80,6 +85,8 @@ spec:
         hostPath:
           path: /var/lib/act-runner-data
           type: DirectoryOrCreate
+      - name: act-cache
+        emptyDir: {}
       - name: config
         configMap:
           name: act-runner-config

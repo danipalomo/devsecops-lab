@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+  namespace: vulnerable-apps
+spec:
+  ports:
+    - port: 3306
+  selector:
+    app: mysql
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-deployment
+  namespace: vulnerable-apps
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "rootpassword123" # VULNERABILIDAD: Contraseña hardcodeada en manifiesto
+        - name: MYSQL_DATABASE
+          value: "dvwa"
+        - name: MYSQL_USER
+          value: "dvwa_user"
+        - name: MYSQL_PASSWORD
+          value: "dvwa_pass"
+        ports:
+        - containerPort: 3306
