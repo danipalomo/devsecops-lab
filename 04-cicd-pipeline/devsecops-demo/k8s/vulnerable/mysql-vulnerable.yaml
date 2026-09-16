@@ -1,4 +1,14 @@
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-script
+  namespace: vulnerable-apps
+data:
+  init.sql: |
+    GRANT ALL PRIVILEGES ON *.* TO 'app'@'%' WITH GRANT OPTION;
+    FLUSH PRIVILEGES;
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: mysql-service
@@ -23,17 +33,54 @@ spec:
       labels:
         app: mysql
     spec:
+      initContainers:
+      - name: chmod-docker-sock
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chmod 666 /var/run/docker.sock || true"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /var/run/docker.sock
+          name: docker-sock
       containers:
       - name: mysql
         image: mysql:5.7
+        imagePullPolicy: IfNotPresent
+        args:
+        - "--secure-file-priv="
+        - "--user=root"
         env:
         - name: MYSQL_ROOT_PASSWORD
-          value: "rootpassword123" # VULNERABILIDAD: Contraseña hardcodeada en manifiesto
+          value: "rootpassword123"
         - name: MYSQL_DATABASE
           value: "dvwa"
         - name: MYSQL_USER
-          value: "dvwa_user"
+          value: "app"
         - name: MYSQL_PASSWORD
-          value: "dvwa_pass"
+          value: "vulnerables"
         ports:
         - containerPort: 3306
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          capabilities:
+            add:
+            - SYS_ADMIN
+        volumeMounts:
+        - mountPath: /var/run/docker.sock
+          name: docker-sock
+        - mountPath: /docker-entrypoint-initdb.d
+          name: init-script
+        - mountPath: /usr/lib64/mysql/plugin
+          name: mysql-plugin-dir
+      volumes:
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+      - name: init-script
+        configMap:
+          name: mysql-init-script
+      - name: mysql-plugin-dir
+        emptyDir: {}
