@@ -14,6 +14,11 @@
 
 > **Aviso ético** Laboratorio 100 % aislado (red local en entorno virtualizado), sobre infraestructura propia y con fines didácticos. [Aviso legal](#aviso-legal-y-licencia).
 
+<p align="center">
+  <a href="https://youtu.be/L-RrVn1mmMc">
+  <img width="2332" height="1288" alt="image" src="https://github.com/user-attachments/assets/a65d601d-4552-4725-8d82-096254f9ba9e" />
+</a>
+
 ---
 
 ## Objetivo
@@ -54,6 +59,28 @@ Y la principal:
 </a>
   <br><em>Animación mostrando la attack-chain completa.</em>
 </p>
+
+
+### Inicial Access
+
+https://github.com/user-attachments/assets/3efdb0bd-d34b-4910-9ae1-30cb16e6c365
+
+
+### Enumeración y Pivoting
+
+https://github.com/user-attachments/assets/b96f2121-90db-4782-9a8e-9c1064729922
+
+
+### Escape al Host EC2
+
+https://github.com/user-attachments/assets/14d907a3-1e34-40a2-957d-d0241ec04970
+
+
+### Explotación Final
+
+https://github.com/user-attachments/assets/3125ff50-c32f-43cc-8f9a-f5f5c5447ea0
+
+
 
 ---
 
