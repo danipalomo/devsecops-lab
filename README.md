@@ -50,7 +50,8 @@ Y la principal:
 
 <p align="center">
   <a href="https://youtu.be/L-RrVn1mmMc">
-  </a>
+  <img width="2332" height="1288" alt="image" src="https://github.com/user-attachments/assets/a65d601d-4552-4725-8d82-096254f9ba9e" />
+</a>
   <br><em>Animación mostrando la attack-chain completa.</em>
 </p>
 
