@@ -27,7 +27,7 @@ Este laboratorio se despliega en un entorno **intencionadamente vulnerable** en 
 
 No se pretende mostrar el OWASP Top 10 web en DVWA. La web es solo el initial foothold para luego **escalar capa a capa, hasta controlar la infraestructura entera** que define todo el entorno, y después **mostrar la remediación de cada vulnerabilidad** (de cada configuración vulnerable se muestra en paralelo su versión hardened).
 
-> Limitación Cloud: la capa cloud corre sobre el emulador de LocalStack, que no aplica el IAM por defecto, así que en la parte del contraste vulnerable/hardened en cloud solo puede validarse por código pero no en ejecución. Se explica en la sección [Alcance y limitaciones](#alcance-supuestos-y-limitaciones).
+> Limitación Cloud: la capa cloud corre sobre el emulador de LocalStack, que no aplica el IAM por defecto, así que en la parte del contraste vulnerable/hardened en cloud solo puede validarse por código pero no en ejecución.
 
 **Stack:** AWS (emulado con LocalStack) · Terraform · Ansible · Kubernetes (K3s) · Gitea + Act-Runner · DVWA · MySQL
 
